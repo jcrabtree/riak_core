@@ -25,12 +25,11 @@
 %%      from each preference list to use in the plan.
 
 -module(riak_core_coverage_plan).
--author('Kelly McLaughlin <kelly@basho.com>').
 
 %% API
 -export([create_plan/5]).
 
--type index() :: non_neg_integer().
+-type index() :: chash:index_as_int().
 -type req_id() :: non_neg_integer().
 -type coverage_vnodes() :: [{index(), node()}].
 -type vnode_filters() :: [{node(), [{index(), [index()]}]}].
@@ -46,23 +45,14 @@
                   req_id(), atom()) ->
                          {error, term()} | coverage_plan().
 create_plan(VNodeSelector, NVal, PVC, ReqId, Service) ->
-    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
-    PartitionCount = riak_core_ring:num_partitions(Ring),
-    %% Get the list of all nodes and the list of available
-    %% nodes so we can have a list of unavailable nodes
-    %% while creating a coverage plan.
-    Nodes = riak_core_ring:all_members(Ring),
-    %% Check which nodes are up for the specified service
-    %% so we can determine which VNodes are ineligible
-    %% to be part of the coverage plan.
-    UpNodes = riak_core_node_watcher:nodes(Service),
+    {ok, CHBin} = riak_core_ring_manager:get_chash_bin(),
+    PartitionCount = chashbin:num_partitions(CHBin),
     %% Create a coverage plan with the requested primary
     %% preference list VNode coverage.
     %% Get a list of the VNodes owned by any unavailble nodes
     DownVNodes = [Index ||
-                     {Index, Node}
-                         <- riak_core_ring:all_owners(Ring),
-                     lists:member(Node, (Nodes -- UpNodes))],
+                     {Index, _Node}
+                         <- riak_core_apl:offline_owners(Service, CHBin)],
     %% Calculate an offset based on the request id to offer
     %% the possibility of different sets of VNodes being
     %% used even when all nodes are available.
@@ -80,7 +70,7 @@ create_plan(VNodeSelector, NVal, PVC, ReqId, Service) ->
                 %% ring position and the increment of
                 %% ring index values.
                 VNodeIndex = (Position rem PartitionCount) * RingIndexInc,
-                Node = riak_core_ring:index_owner(Ring, VNodeIndex),
+                Node = chashbin:index_owner(VNodeIndex, CHBin),
                 CoverageVNode = {VNodeIndex, Node},
                 case length(KeySpaces) < NVal of
                     true ->

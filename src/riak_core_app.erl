@@ -64,21 +64,18 @@ start(_StartType, _StartArgs) ->
 
     %% add these defaults now to supplement the set that may have been
     %% configured in app.config
-    riak_core_bucket:append_bucket_defaults(
-      [{n_val,3},
-       {allow_mult,false},
-       {last_write_wins,false},
-       {precommit, []},
-       {postcommit, []},
-       {chash_keyfun, {riak_core_util, chash_std_keyfun}}]),
+    riak_core_bucket:append_bucket_defaults(riak_core_bucket_type:defaults()),
 
     %% Spin up the supervisor; prune ring files as necessary
     case riak_core_sup:start_link() of
         {ok, Pid} ->
-            riak_core:register(riak_core, [{stat_mod, riak_core_stat}]),
+            riak_core:register(riak_core, [{stat_mod, riak_core_stat},
+                                           {permissions, [get_bucket,
+                                                          set_bucket,
+                                                          get_bucket_type,
+                                                          set_bucket_type]}]),
             ok = riak_core_ring_events:add_guarded_handler(riak_core_ring_handler, []),
 
-            %% Register capabilities
             riak_core_capability:register({riak_core, vnode_routing},
                                           [proxy, legacy],
                                           legacy,
@@ -88,6 +85,21 @@ start(_StartType, _StartArgs) ->
             riak_core_capability:register({riak_core, staged_joins},
                                           [true, false],
                                           false),
+            riak_core_capability:register({riak_core, resizable_ring},
+                                          [true, false],
+                                          false),
+            riak_core_capability:register({riak_core, fold_req_version},
+                                          [v2, v1],
+                                          v1),
+            riak_core_capability:register({riak_core, security},
+                                          [true, false],
+                                          false),
+            riak_core_capability:register({riak_core, bucket_types},
+                                          [true, false],
+                                          false),
+            riak_core_capability:register({riak_core, net_ticktime},
+                                          [true, false],
+                                          false),
 
             {ok, Pid};
         {error, Reason} ->
@@ -95,4 +107,5 @@ start(_StartType, _StartArgs) ->
     end.
 
 stop(_State) ->
+    lager:info("Stopped  application riak_core.\n", []),
     ok.

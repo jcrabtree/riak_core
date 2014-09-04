@@ -27,7 +27,7 @@
 -export([start_link/0, stop/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
--export([all_vnodes/0, all_vnodes/1, all_vnodes_status/0, ring_changed/1,
+-export([all_vnodes/0, all_vnodes/1, all_vnodes_status/0,
          force_handoffs/0, repair/3, repair_status/1, xfer_complete/2,
          kill_repairs/1]).
 -export([all_index_pid/1, get_vnode_pid/2, start_vnode/2,
@@ -40,6 +40,7 @@
 -endif.
 
 -record(idxrec, {key, idx, mod, pid, monref}).
+-record(monrec, {monref, key}).
 
 -record(xfer_status, {
           status                :: pending | complete,
@@ -59,11 +60,12 @@
 -type repairs() :: [repair()].
 
 -record(state, {idxtab,
-                forwarding :: [pid()],
-                handoff :: [{term(), integer(), pid(), node()}],
+                forwarding :: dict(),
+                handoff :: dict(),
                 known_modules :: [term()],
                 never_started :: [{integer(), term()}],
                 vnode_start_tokens :: integer(),
+                last_ring_id :: term(),
                 repairs :: repairs()
                }).
 
@@ -72,6 +74,9 @@
 -define(XFER_EQ(A, ModSrcTgt), A#xfer_status.mod_src_target == ModSrcTgt).
 -define(XFER_COMPLETE(X), X#xfer_status.status == complete).
 -define(DEFAULT_OWNERSHIP_TRIGGER, 8).
+-define(ETS, ets_vnode_mgr).
+-define(DEFAULT_VNODE_ROLLING_START, 16).
+-define(LONG_TIMEOUT, 120*1000).
 
 %% ===================================================================
 %% Public API
@@ -83,14 +88,8 @@ start_link() ->
 stop() ->
     gen_server:cast(?MODULE, stop).
 
-all_vnodes() ->
-    gen_server:call(?MODULE, all_vnodes).
-
-all_vnodes(Mod) ->
-    gen_server:call(?MODULE, {all_vnodes, Mod}).
-
 all_vnodes_status() ->
-    gen_server:call(?MODULE, all_vnodes_status).
+    gen_server:call(?MODULE, all_vnodes_status, infinity).
 
 %% @doc Repair the given `ModPartition' pair for `Service' using the
 %%      given `FilterModFun' to filter keys.
@@ -104,31 +103,24 @@ repair(Service, {_Module, Partition}=ModPartition, FilterModFun) ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     Owner = riak_core_ring:index_owner(Ring, Partition),
     Msg = {repair, Service, ModPartition, FilterModFun},
-    gen_server:call({?MODULE, Owner}, Msg).
+    gen_server:call({?MODULE, Owner}, Msg, ?LONG_TIMEOUT).
 
 %% @doc Get the status of the repair process for a given `ModPartition'.
 -spec repair_status(mod_partition()) -> in_progress | not_found.
 repair_status({_Module, Partition}=ModPartition) ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     Owner = riak_core_ring:index_owner(Ring, Partition),
-    gen_server:call({?MODULE, Owner}, {repair_status, ModPartition}).
+    gen_server:call({?MODULE, Owner}, {repair_status, ModPartition}, ?LONG_TIMEOUT).
 
 %% TODO: make cast with retry on handoff sender side and handshake?
 %%
 %% TODO: second arg has specific form but maybe make proplist?
 -spec xfer_complete(node(), tuple()) -> ok.
 xfer_complete(Origin, Xfer) ->
-    gen_server:call({?MODULE, Origin}, {xfer_complete, Xfer}).
+    gen_server:call({?MODULE, Origin}, {xfer_complete, Xfer}, ?LONG_TIMEOUT).
 
 kill_repairs(Reason) ->
     gen_server:cast(?MODULE, {kill_repairs, Reason}).
-
-ring_changed(_TaintedRing) ->
-    %% The ring passed into ring events is the locally modified tainted ring.
-    %% Since the vnode manager uses operations that cannot work on the
-    %% tainted ring, we must retreive the raw ring directly.
-    {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
-    gen_server:cast(?MODULE, {ring_changed, Ring}).
 
 %% @doc Provided for support/debug purposes. Forces all running vnodes to start
 %%      handoff. Limited by handoff_concurrency setting and therefore may need
@@ -142,12 +134,6 @@ unregister_vnode(Index, VNodeMod) ->
 unregister_vnode(Index, Pid, VNodeMod) ->
     gen_server:cast(?MODULE, {unregister, Index, VNodeMod, Pid}).
 
-all_index_pid(VNodeMod) ->
-    gen_server:call(?MODULE, {all_index_pid, VNodeMod}, infinity).
-
-get_vnode_pid(Index, VNodeMod) ->
-    gen_server:call(?MODULE, {Index, VNodeMod, get_vnode}, infinity).
-
 start_vnode(Index, VNodeMod) ->
     gen_server:cast(?MODULE, {Index, VNodeMod, start_vnode}).
 
@@ -157,21 +143,79 @@ vnode_event(Mod, Idx, Pid, Event) ->
 get_tab() ->
     gen_server:call(?MODULE, get_tab, infinity).
 
+get_vnode_pid(Index, VNodeMod) ->
+    gen_server:call(?MODULE, {Index, VNodeMod, get_vnode}, infinity).
+
+%% ===================================================================
+%% ETS-based API: try to determine response by reading protected ETS
+%%                table, falling back to a vnode manager call if
+%%                ETS table is missing.
+%% ===================================================================
+
+all_vnodes() ->
+    case get_all_vnodes() of
+        [] ->
+            %% ETS error could produce empty list, call manager to be sure.
+            gen_server:call(?MODULE, all_vnodes, infinity);
+        Result ->
+            Result
+    end.
+
+all_vnodes(Mod) ->
+    case get_all_vnodes(Mod) of
+        [] ->
+            %% ETS error could produce empty list, call manager to be sure.
+            gen_server:call(?MODULE, {all_vnodes, Mod}, infinity);
+        Result ->
+            Result
+    end.
+
+all_index_pid(VNodeMod) ->
+    case get_all_index_pid(VNodeMod, ets_error) of
+        ets_error ->
+            gen_server:call(?MODULE, {all_index_pid, VNodeMod}, infinity);
+        Result ->
+            Result
+    end.
+
+%% ===================================================================
+%% Protected ETS Accessors
+%% ===================================================================
+
+get_all_index_pid(Mod, Default) ->
+    try
+        [list_to_tuple(L)
+         || L <- ets:match(?ETS, {idxrec, '_', '$1', Mod, '$2', '_'})]
+    catch
+        _:_ ->
+            Default
+    end.
+
+get_all_vnodes() ->
+    Mods = [Mod || {_App, Mod} <- riak_core:vnode_modules()],
+    get_all_vnodes(Mods).
+
+get_all_vnodes(Mods) when is_list(Mods) ->
+    lists:flatmap(fun(Mod) -> get_all_vnodes(Mod) end, Mods);
+get_all_vnodes(Mod) ->
+    IdxPids = get_all_index_pid(Mod, []),
+    [{Mod, Idx, Pid} || {Idx, Pid} <- IdxPids].
+
 %% ===================================================================
 %% gen_server behaviour
 %% ===================================================================
 
 %% @private
 init(_State) ->
-    {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
+    {ok, Ring, CHBin} = riak_core_ring_manager:get_raw_ring_chashbin(),
     Mods = [Mod || {_, Mod} <- riak_core:vnode_modules()],
-    State = #state{forwarding=[], handoff=[],
+    State = #state{forwarding=dict:new(), handoff=dict:new(),
                    known_modules=[], never_started=[], vnode_start_tokens=0,
                    repairs=[]},
     State2 = find_vnodes(State),
-    AllVNodes = get_all_vnodes(Mods, State2),
+    AllVNodes = get_all_vnodes(Mods),
     State3 = update_forwarding(AllVNodes, Mods, Ring, State2),
-    State4 = update_handoff(AllVNodes, Ring, State3),
+    State4 = update_handoff(AllVNodes, Ring, CHBin, State3),
     schedule_management_timer(),
     {ok, State4}.
 
@@ -183,7 +227,7 @@ find_vnodes(State) ->
     VnodePids = [Pid || {_, Pid, worker, _}
                             <- supervisor:which_children(riak_core_vnode_sup),
                         is_pid(Pid) andalso is_process_alive(Pid)],
-    IdxTable = ets:new(ets_vnodes, [{keypos, 2}, private]),
+    IdxTable = ets:new(?ETS, [{keypos, 2}, named_table, protected]),
 
     %% If the vnode manager is being restarted, scan the existing
     %% vnode children and work out which module and index they are
@@ -206,7 +250,9 @@ find_vnodes(State) ->
                           monref = Mref }
         end,
     IdxRecs = [F(Pid, Idx, Mod) || {Pid, {Mod, Idx}} <- PidIdxs],
-    true = ets:insert_new(IdxTable, IdxRecs),
+    MonRecs = [#monrec{monref=Mref, key=Key}
+               || #idxrec{key=Key, monref=Mref} <- IdxRecs],
+    true = ets:insert_new(IdxTable, IdxRecs ++ MonRecs),
     State#state{idxtab=IdxTable}.
 
 %% @private
@@ -214,13 +260,13 @@ handle_call(all_vnodes_status, _From, State) ->
     Reply = get_all_vnodes_status(State),
     {reply, Reply, State};
 handle_call(all_vnodes, _From, State) ->
-    Reply = get_all_vnodes(State),
+    Reply = get_all_vnodes(),
     {reply, Reply, State};
 handle_call({all_vnodes, Mod}, _From, State) ->
-    Reply = get_all_vnodes(Mod, State),
+    Reply = get_all_vnodes(Mod),
     {reply, Reply, State};
 handle_call({all_index_pid, Mod}, _From, State) ->
-    Reply = get_all_index_pid(Mod, State),
+    Reply = get_all_index_pid(Mod, []),
     {reply, Reply, State};
 handle_call({Partition, Mod, get_vnode}, _From, State) ->
     Pid = get_vnode(Partition, Mod, State),
@@ -322,7 +368,7 @@ handle_call(_, _From, State) ->
 
 %% @private
 handle_cast({Partition, Mod, start_vnode}, State) ->
-    get_vnode(Partition, Mod, State),
+    _ = get_vnode(Partition, Mod, State),
     {noreply, State};
 handle_cast({unregister, Index, Mod, Pid}, #state{idxtab=T} = State) ->
     %% Update forwarding state to ensure vnode is not restarted in
@@ -336,58 +382,17 @@ handle_cast({unregister, Index, Mod, Pid}, #state{idxtab=T} = State) ->
 handle_cast({vnode_event, Mod, Idx, Pid, Event}, State) ->
     handle_vnode_event(Event, Mod, Idx, Pid, State);
 handle_cast(force_handoffs, State) ->
-    AllVNodes = get_all_vnodes(State),
-    {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
-    State2 = update_handoff(AllVNodes, Ring, State),
+    AllVNodes = get_all_vnodes(),
+    {ok, Ring, CHBin} = riak_core_ring_manager:get_raw_ring_chashbin(),
+    State2 = update_handoff(AllVNodes, Ring, CHBin, State),
 
-    [maybe_trigger_handoff(Mod, Idx, Pid, State2)
-     || {Mod, Idx, Pid} <- AllVNodes],
+    _ = [maybe_trigger_handoff(Mod, Idx, Pid, State2)
+         || {Mod, Idx, Pid} <- AllVNodes],
 
     {noreply, State2};
-handle_cast({ring_changed, Ring}, State) ->
-    %% Update vnode forwarding state
-    AllVNodes = get_all_vnodes(State),
-    Mods = [Mod || {_, Mod} <- riak_core:vnode_modules()],
-    State2 = update_forwarding(AllVNodes, Mods, Ring, State),
-
-    %% Update handoff state
-    State3 = update_handoff(AllVNodes, Ring, State2),
-
-    %% Trigger ownership transfers.
-    Transfers = riak_core_ring:pending_changes(Ring),
-    trigger_ownership_handoff(Transfers, Mods, State3),
-
-    {noreply, State3};
-
-handle_cast(management_tick, State) ->
-    schedule_management_timer(),
-    {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
-    Mods = [Mod || {_, Mod} <- riak_core:vnode_modules()],
-    AllVNodes = get_all_vnodes(Mods, State),
-    State2 = update_handoff(AllVNodes, Ring, State),
-    Transfers = riak_core_ring:pending_changes(Ring),
-
-    %% Kill/cancel any repairs during ownership changes
-    State3 =
-        case Transfers of
-            [] ->
-                State2;
-            _ ->
-                Repairs = State#state.repairs,
-                kill_repairs(Repairs, ownership_change),
-                trigger_ownership_handoff(Transfers, Mods, State2),
-                State2#state{repairs=[]}
-        end,
-
-    MaxStart = app_helper:get_env(riak_core, vnode_rolling_start, 16),
-    State4 = State3#state{vnode_start_tokens=MaxStart},
-    State5 = maybe_start_vnodes(Ring, State4),
-
-    Repairs2 = check_repairs(State4#state.repairs),
-    {noreply, State5#state{repairs=Repairs2}};
 
 handle_cast(maybe_start_vnodes, State) ->
-    {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
+    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     State2 = maybe_start_vnodes(Ring, State),
     {noreply, State2};
 
@@ -399,6 +404,36 @@ handle_cast({kill_repairs, Reason}, State) ->
 handle_cast(_, State) ->
     {noreply, State}.
 
+handle_info(management_tick, State0) ->
+    schedule_management_timer(),
+    RingID = riak_core_ring_manager:get_ring_id(),
+    {ok, Ring, CHBin} = riak_core_ring_manager:get_raw_ring_chashbin(),
+    State = maybe_ring_changed(RingID, Ring, CHBin, State0),
+    Mods = [Mod || {_, Mod} <- riak_core:vnode_modules()],
+    AllVNodes = get_all_vnodes(Mods),
+    State2 = update_handoff(AllVNodes, Ring, CHBin, State),
+    Transfers = riak_core_ring:pending_changes(Ring),
+
+    %% Kill/cancel any repairs during ownership changes
+    State3 =
+        case Transfers of
+            [] ->
+                State2;
+            _ ->
+                Repairs = State#state.repairs,
+                kill_repairs(Repairs, ownership_change),
+                trigger_ownership_handoff(Transfers, Mods, Ring, State2),
+                State2#state{repairs=[]}
+        end,
+
+    MaxStart = app_helper:get_env(riak_core, vnode_rolling_start,
+                                  ?DEFAULT_VNODE_ROLLING_START),
+    State4 = State3#state{vnode_start_tokens=MaxStart},
+    State5 = maybe_start_vnodes(Ring, State4),
+
+    Repairs2 = check_repairs(State4#state.repairs),
+    {noreply, State5#state{repairs=Repairs2}};
+
 handle_info({'DOWN', MonRef, process, _P, _I}, State) ->
     delmon(MonRef, State),
     {noreply, State}.
@@ -408,11 +443,11 @@ handle_vnode_event(inactive, Mod, Idx, Pid, State) ->
     maybe_trigger_handoff(Mod, Idx, Pid, State),
     {noreply, State};
 handle_vnode_event(handoff_complete, Mod, Idx, Pid, State) ->
-    NewHO = orddict:erase({Mod, Idx}, State#state.handoff),
+    NewHO = dict:erase({Mod, Idx}, State#state.handoff),
     gen_fsm:send_all_state_event(Pid, finish_handoff),
     {noreply, State#state{handoff=NewHO}};
 handle_vnode_event(handoff_error, Mod, Idx, Pid, State) ->
-    NewHO = orddict:erase({Mod, Idx}, State#state.handoff),
+    NewHO = dict:erase({Mod, Idx}, State#state.handoff),
     gen_fsm:send_all_state_event(Pid, cancel_handoff),
     {noreply, State#state{handoff=NewHO}}.
 
@@ -429,43 +464,84 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal functions
 %% ===================================================================
 
+maybe_ring_changed(RingID, Ring, CHBin, State=#state{last_ring_id=LastID}) ->
+    case RingID of
+        LastID ->
+            maybe_ensure_vnodes_started(Ring),
+            State;
+        _ ->
+            ensure_vnodes_started(Ring),
+            State2 = ring_changed(Ring, CHBin, State),
+            State2#state{last_ring_id=RingID}
+    end.
+
+ring_changed(Ring, CHBin, State) ->
+    %% Update vnode forwarding state
+    AllVNodes = get_all_vnodes(),
+    Mods = [Mod || {_, Mod} <- riak_core:vnode_modules()],
+    State2 = update_forwarding(AllVNodes, Mods, Ring, State),
+
+    %% Update handoff state
+    State3 = update_handoff(AllVNodes, Ring, CHBin, State2),
+
+    %% Trigger ownership transfers.
+    Transfers = riak_core_ring:pending_changes(Ring),
+    trigger_ownership_handoff(Transfers, Mods, Ring, State3),
+    State3.
+
+maybe_ensure_vnodes_started(Ring) ->
+    ExitingStates = [leaving, exiting, invalid],
+    Status = riak_core_ring:member_status(Ring, node()),
+    case lists:member(Status, ExitingStates) of
+        true ->
+            ensure_vnodes_started(Ring),
+            ok;
+        _ ->
+            ok
+    end.
+
+ensure_vnodes_started(Ring) ->
+    spawn(fun() ->
+                  try
+                      riak_core_ring_handler:ensure_vnodes_started(Ring)
+                  catch
+                      T:R ->
+                          lager:error("~p", [{T, R, erlang:get_stacktrace()}])
+                  end
+          end).
+
 schedule_management_timer() ->
     ManagementTick = app_helper:get_env(riak_core,
                                         vnode_management_timer,
                                         10000),
-    timer:apply_after(ManagementTick, gen_server, cast, [?MODULE, management_tick]).
+    erlang:send_after(ManagementTick, ?MODULE, management_tick).
 
-trigger_ownership_handoff(Transfers, Mods, State) ->
-    Limit = app_helper:get_env(riak_core,
-                               forced_ownership_handoff,
-                               ?DEFAULT_OWNERSHIP_TRIGGER),
-    Throttle = lists:sublist(Transfers, Limit),
+trigger_ownership_handoff(Transfers, Mods, Ring, State) ->
+    IsResizing = riak_core_ring:is_resizing(Ring),
+    Throttle = limit_ownership_handoff(Transfers, IsResizing),
     Awaiting = [{Mod, Idx} || {Idx, Node, _, CMods, S} <- Throttle,
                               Mod <- Mods,
                               S =:= awaiting,
                               Node =:= node(),
                               not lists:member(Mod, CMods)],
-    [maybe_trigger_handoff(Mod, Idx, State) || {Mod, Idx} <- Awaiting],
+    _ = [maybe_trigger_handoff(Mod, Idx, State) || {Mod, Idx} <- Awaiting],
     ok.
 
-get_all_index_pid(Mod, State) ->
-    [list_to_tuple(L) 
-     || L <- ets:match(State#state.idxtab, {idxrec, '_', '$1', Mod, '$2', '_'})].
+limit_ownership_handoff(Transfers, IsResizing) ->
+    Limit = app_helper:get_env(riak_core,
+                               forced_ownership_handoff,
+                               ?DEFAULT_OWNERSHIP_TRIGGER),
+    limit_ownership_handoff(Limit, Transfers, IsResizing).
 
-get_all_vnodes(State) ->
-    Mods = [Mod || {_App, Mod} <- riak_core:vnode_modules()],
-    get_all_vnodes(Mods, State).
-
-get_all_vnodes(Mods, State) when is_list(Mods) ->
-    lists:flatmap(fun(Mod) -> get_all_vnodes(Mod, State) end, Mods);
-get_all_vnodes(Mod, State) ->
-    try get_all_index_pid(Mod, State) of
-        IdxPids ->
-            [{Mod, Idx, Pid} || {Idx, Pid} <- IdxPids]
-    catch
-        _:_ ->
-            []
-    end.
+limit_ownership_handoff(Limit, Transfers, false) ->
+    lists:sublist(Transfers, Limit);
+limit_ownership_handoff(Limit, Transfers, true) ->
+    %% if we are resizing: filter out completed resize operations,
+    %% since they remain in the list until all are complete. then
+    %% treat transfers as normal
+    Filtered = [Transfer || {_,_,_,_,Status}=Transfer <- Transfers,
+                            Status =:= awaiting],
+    limit_ownership_handoff(Limit, Filtered, false).
 
 %% @private
 idx2vnode(Idx, Mod, _State=#state{idxtab=T}) ->
@@ -476,26 +552,58 @@ idx2vnode(Idx, Mod, _State=#state{idxtab=T}) ->
 
 %% @private
 delmon(MonRef, _State=#state{idxtab=T}) ->
-    ets:match_delete(T, {idxrec, '_', '_', '_', '_', MonRef}).
+    case ets:lookup(T, MonRef) of
+        [#monrec{key=Key}] ->
+            ets:match_delete(T, {idxrec, Key, '_', '_', '_', MonRef}),
+            ets:delete(T, MonRef);
+        [] ->
+            ets:match_delete(T, {idxrec, '_', '_', '_', '_', MonRef})
+    end.
 
 %% @private
 add_vnode_rec(I,  _State=#state{idxtab=T}) -> ets:insert(T,I).
 
 %% @private
-get_vnode(Idx, Mod, State) ->
-    case idx2vnode(Idx, Mod, State) of
-        no_match ->
-            ForwardTo = get_forward(Mod, Idx, State),
-            {ok, Pid} = riak_core_vnode_sup:start_vnode(Mod, Idx, ForwardTo),
-            MonRef = erlang:monitor(process, Pid),
-            add_vnode_rec(#idxrec{key={Idx,Mod},idx=Idx,mod=Mod,pid=Pid,
-                                  monref=MonRef}, State),
-            Pid;
-        X -> X
-    end.
+get_vnode(Idx, Mod, State) when not is_list(Idx) ->
+    [Result] = get_vnode([Idx], Mod, State),
+    Result;
+get_vnode(IdxList, Mod, State) ->
+    Initial =
+        [case idx2vnode(Idx, Mod, State) of
+             no_match -> Idx;
+             Pid      -> {Idx, Pid}
+         end
+        || Idx <- IdxList],
+    {NotStarted, Started} = lists:partition(fun erlang:is_integer/1, Initial),
+    StartFun =
+        fun(Idx) ->
+                 ForwardTo = get_forward(Mod, Idx, State),
+                 lager:debug("Will start VNode for partition ~p", [Idx]),
+                 {ok, Pid} =
+                     riak_core_vnode_sup:start_vnode(Mod, Idx, ForwardTo),
+                 lager:debug("Started VNode, waiting for initialization to complete ~p, ~p ", [Pid, Idx]),
+                 ok = riak_core_vnode:wait_for_init(Pid),
+                 lager:debug("VNode initialization ready ~p, ~p", [Pid, Idx]),
+                 {Idx, Pid}
+        end,
+   MaxStart = app_helper:get_env(riak_core, vnode_parallel_start,
+                                  ?DEFAULT_VNODE_ROLLING_START),
+    Pairs = Started ++ riak_core_util:pmap(StartFun, NotStarted, MaxStart),
+    % Return Pids in same order as input
+    PairsDict = dict:from_list(Pairs),
+    _ = [begin
+         Pid = dict:fetch(Idx, PairsDict),
+         MonRef = erlang:monitor(process, Pid),
+         IdxRec = #idxrec{key={Idx,Mod},idx=Idx,mod=Mod,pid=Pid,
+                          monref=MonRef},
+         MonRec = #monrec{monref=MonRef, key={Idx,Mod}},
+         add_vnode_rec([IdxRec, MonRec], State)
+     end || Idx <- NotStarted],
+    [ dict:fetch(Idx, PairsDict) || Idx <- IdxList].
+
 
 get_forward(Mod, Idx, #state{forwarding=Fwd}) ->
-    case orddict:find({Mod, Idx}, Fwd) of
+    case dict:find({Mod, Idx}, Fwd) of
         {ok, ForwardTo} ->
             ForwardTo;
         _ ->
@@ -505,37 +613,65 @@ get_forward(Mod, Idx, #state{forwarding=Fwd}) ->
 check_forward(Ring, Mod, Index) ->
     Node = node(),
     case riak_core_ring:next_owner(Ring, Index, Mod) of
+        {Node, '$resize', _} ->
+            Complete = riak_core_ring:complete_resize_transfers(Ring, {Index, Node}, Mod),
+            {{Mod, Index}, Complete};
+        {Node, '$delete', _} ->
+            {{Mod, Index}, undefined};
         {Node, NextOwner, complete} ->
             {{Mod, Index}, NextOwner};
         _ ->
             {{Mod, Index}, undefined}
     end.
 
+check_forward_precomputed(Completed, Mod, Index, Node, Ring) ->
+    case dict:find({Mod, Index}, Completed) of
+        {ok, '$resize'} ->
+            Complete = riak_core_ring:complete_resize_transfers(Ring, {Index, Node}, Mod),
+            {{Mod, Index}, Complete};
+        {ok, '$delete'} ->
+            {{Mod, Index}, undefined};
+        {ok, NextOwner} ->
+            {{Mod, Index}, NextOwner};
+        _ ->
+            {{Mod, Index}, undefined}
+    end.
+
 compute_forwarding(Mods, Ring) ->
-    {AllIndices, _} = lists:unzip(riak_core_ring:all_owners(Ring)),
-    Forwarding = [check_forward(Ring, Mod, Index) || Index <- AllIndices,
-                                                     Mod <- Mods],
-    orddict:from_list(Forwarding).
+    Node = node(),
+    CL = [{{Mod, Idx}, NextOwner}
+          || Mod <- Mods,
+             {Idx, Owner, NextOwner} <- riak_core_ring:completed_next_owners(Mod, Ring),
+             Owner =:= Node],
+    Completed = dict:from_list(CL),
+    Forwarding = [check_forward_precomputed(Completed, Mod, I, N, Ring)
+                  || {I, N} <- riak_core_ring:all_owners(Ring),
+                     Mod <- Mods],
+    dict:from_list(Forwarding).
 
 update_forwarding(AllVNodes, Mods, Ring,
                   State=#state{forwarding=Forwarding}) ->
     NewForwarding = compute_forwarding(Mods, Ring),
 
     %% Inform vnodes that have changed forwarding status
-    VNodes = lists:sort([{{Mod, Idx}, Pid} || {Mod, Idx, Pid} <- AllVNodes]),
-    Diff = NewForwarding -- Forwarding,
-    [change_forward(VNodes, Mod, Idx, ForwardTo)
-     || {{Mod, Idx}, ForwardTo} <- Diff],
+    VNodes = dict:from_list([{{Mod, Idx}, Pid} || {Mod, Idx, Pid} <- AllVNodes]),
+    Diff = dict:filter(fun(K,V) ->
+                               dict:find(K, Forwarding) /= {ok, V}
+                       end, NewForwarding),
+    dict:fold(fun({Mod, Idx}, ForwardTo, _) ->
+                      change_forward(VNodes, Mod, Idx, ForwardTo),
+                      ok
+              end, ok, Diff),
 
     State#state{forwarding=NewForwarding}.
 
 update_forwarding({Mod, Idx}, Ring, State=#state{forwarding=Forwarding}) ->
     {_, ForwardTo} = check_forward(Ring, Mod, Idx),
-    NewForwarding = orddict:store({Mod, Idx}, ForwardTo, Forwarding),
+    NewForwarding = dict:store({Mod, Idx}, ForwardTo, Forwarding),
     State#state{forwarding=NewForwarding}.
 
 change_forward(VNodes, Mod, Idx, ForwardTo) ->
-    case orddict:find({Mod, Idx}, VNodes) of
+    case dict:find({Mod, Idx}, VNodes) of
         error ->
             ok;
         {ok, Pid} ->
@@ -543,27 +679,31 @@ change_forward(VNodes, Mod, Idx, ForwardTo) ->
             ok
     end.
 
-update_handoff(AllVNodes, Ring, State) ->
+update_handoff(AllVNodes, Ring, CHBin, State) ->
     case riak_core_ring:ring_ready(Ring) of
         false ->
             State;
         true ->
-            NewHO = lists:flatten([case should_handoff(Ring, Mod, Idx) of
+            NewHO = lists:flatten([case should_handoff(Ring, CHBin, Mod, Idx) of
                                        false ->
                                            [];
                                        {true, TargetNode} ->
                                            [{{Mod, Idx}, TargetNode}]
                                    end || {Mod, Idx, _Pid} <- AllVNodes]),
-            State#state{handoff=orddict:from_list(NewHO)}
+            State#state{handoff=dict:from_list(NewHO)}
     end.
 
-should_handoff(Ring, Mod, Idx) ->
+should_handoff(Ring, _CHBin, Mod, Idx) ->
     {_, NextOwner, _} = riak_core_ring:next_owner(Ring, Idx),
-    Owner = riak_core_ring:index_owner(Ring, Idx),
+    Type = riak_core_ring:vnode_type(Ring, Idx),
     Ready = riak_core_ring:ring_ready(Ring),
-    case determine_handoff_target(Ready, Owner, NextOwner) of
+    IsResizing = riak_core_ring:is_resizing(Ring),
+    case determine_handoff_target(Type, NextOwner, Ready, IsResizing) of
         undefined ->
             false;
+        Action when Action == '$resize' orelse
+                    Action == '$delete' ->
+            {true, Action};
         TargetNode ->
             case app_for_vnode_module(Mod) of
                 undefined -> false;
@@ -576,26 +716,33 @@ should_handoff(Ring, Mod, Idx) ->
             end
     end.
 
-determine_handoff_target(Ready, Owner, NextOwner) ->
+determine_handoff_target(Type, NextOwner, Ready, IsResizing) ->
     Me = node(),
-    TargetNode = case {Ready, Owner, NextOwner} of
-                     {_, _, Me} ->
-                         Me;
-                     {_, Me, undefined} ->
-                         Me;
-                     {true, Me, _} ->
-                         NextOwner;
-                     {_, _, undefined} ->
-                         Owner;
-                     {_, _, _} ->
-                         Me
-                 end,
-    case TargetNode of
-        Me ->
-            undefined;
-        _ ->
-            TargetNode
+    case {Type, NextOwner, Ready, IsResizing} of
+        %% if primary and next owner is me, don't handoff
+        {primary, Me, _, _} -> undefined;
+        %% if primary, don't handoff if no next owner
+        {primary, undefined, _, _} -> undefined;
+        %% if primary and ring ready, target is next owner (may be undef)
+        {primary, _, true, _} -> NextOwner;
+        %% otherwise, if primary don't handoff
+        {primary, _, _, _} -> undefined;
+        %% partitions moved during resize and scheduled for deletion, indexes
+        %% that exist in both the original and resized ring that were moved appear
+        %% as fallbacks.
+        {{fallback, _}, '$delete', _, _} -> '$delete';
+        %% partitions that no longer exist after the ring has been resized (shrunk)
+        %% scheduled for deletion
+        {resized_primary, '$delete', _, _} -> '$delete';
+        %% partitions that would have existed in a ring whose expansion was aborted
+        %% and are still running need to be cleaned up after and shutdown
+        {resized_primary, _, _, false} -> '$delete';
+        %% fallback vnode target is primary (For)
+        {{fallback, For}, undefined, _, _} -> For;
+        %% otherwise don't handoff
+        {_, _, _, _} -> undefined
     end.
+
 
 app_for_vnode_module(Mod) when is_atom(Mod) ->
     case application:get_env(riak_core, vnode_modules) of
@@ -614,7 +761,16 @@ maybe_trigger_handoff(Mod, Idx, State) ->
     maybe_trigger_handoff(Mod, Idx, Pid, State).
 
 maybe_trigger_handoff(Mod, Idx, Pid, _State=#state{handoff=HO}) ->
-    case orddict:find({Mod, Idx}, HO) of
+    case dict:find({Mod, Idx}, HO) of
+        {ok, '$resize'} ->
+            {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+            case riak_core_ring:awaiting_resize_transfer(Ring, {Idx, node()}, Mod) of
+                undefined -> ok;
+                {TargetIdx, TargetNode} ->
+                    riak_core_vnode:trigger_handoff(Pid, TargetIdx, TargetNode)
+            end;
+        {ok, '$delete'} ->
+            riak_core_vnode:trigger_delete(Pid);
         {ok, TargetNode} ->
             riak_core_vnode:trigger_handoff(Pid, TargetNode),
             ok;
@@ -622,10 +778,10 @@ maybe_trigger_handoff(Mod, Idx, Pid, _State=#state{handoff=HO}) ->
             ok
     end.
 
-get_all_vnodes_status(State=#state{forwarding=Forwarding, handoff=HO}) ->
+get_all_vnodes_status(#state{forwarding=Forwarding, handoff=HO}) ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     Owners = riak_core_ring:all_owners(Ring),
-    VNodes = get_all_vnodes(State),
+    VNodes = get_all_vnodes(),
     Mods = [Mod || {_App, Mod} <- riak_core:vnode_modules()],
 
     ThisNode = node(),
@@ -639,9 +795,11 @@ get_all_vnodes_status(State=#state{forwarding=Forwarding, handoff=HO}) ->
     Types2 = lists:keysort(1, Types),
     Pids = [{{Mod, Idx}, {pid, Pid}} || {Mod, Idx, Pid} <- VNodes],
     Pids2 = lists:keysort(1, Pids),
-    Forwarding2 = [{MI, {forwarding, Node}} || {MI,Node} <- Forwarding,
+    Forwarding1 = lists:sort(dict:to_list(Forwarding)),
+    Forwarding2 = [{MI, {forwarding, Node}} || {MI,Node} <- Forwarding1,
                                                Node /= undefined],
-    Handoff2 = [{MI, {should_handoff, Node}} || {MI,Node} <- HO],
+    Handoff1 = lists:sort(dict:to_list(HO)),
+    Handoff2 = [{MI, {should_handoff, Node}} || {MI,Node} <- Handoff1],
 
     MergeFn = fun(_, V1, V2) when is_list(V1) and is_list(V2) ->
                       V1 ++ V2;
@@ -655,24 +813,21 @@ get_all_vnodes_status(State=#state{forwarding=Forwarding, handoff=HO}) ->
                          end, Types2, [Pids2, Forwarding2, Handoff2]),
     Status.
 
-update_never_started(Ring, State) ->
-    {Indices, _} = lists:unzip(riak_core_ring:all_owners(Ring)),
-    lists:foldl(fun({_App, Mod}, StateAcc) ->
-                        case lists:member(Mod, StateAcc#state.known_modules) of
-                            false ->
-                                update_never_started(Mod, Indices, StateAcc);
-                            true ->
-                                StateAcc
-                        end
-                end, State, riak_core:vnode_modules()).
+update_never_started(Ring, State=#state{known_modules=KnownMods}) ->
+    UnknownMods = [Mod || {_App, Mod} <- riak_core:vnode_modules(),
+                          not lists:member(Mod, KnownMods)],
+    case UnknownMods of
+        [] ->
+            State;
+        _ ->
+            Indices = [Idx || {Idx, _} <- riak_core_ring:all_owners(Ring)],
+            lists:foldl(fun(Mod, StateAcc) ->
+                                update_never_started(Mod, Indices, StateAcc)
+                        end, State, UnknownMods)
+    end.
 
 update_never_started(Mod, Indices, State) ->
-    IdxPids =
-        try
-            get_all_index_pid(Mod, State)
-        catch
-            _:_ -> []
-        end,
+    IdxPids = get_all_index_pid(Mod, []),
     AlreadyStarted = [Idx || {Idx, _Pid} <- IdxPids],
     NeverStarted = ordsets:subtract(ordsets:from_list(Indices),
                                     ordsets:from_list(AlreadyStarted)),
@@ -694,7 +849,7 @@ maybe_start_vnodes(State=#state{vnode_start_tokens=Tokens,
         {_, []} ->
             State;
         {_, [{Idx, Mod} | NeverStarted2]} ->
-            get_vnode(Idx, Mod, State),
+            _ = get_vnode(Idx, Mod, State),
             gen_server:cast(?MODULE, maybe_start_vnodes),
             State#state{vnode_start_tokens=Tokens-1,
                         never_started=NeverStarted2}
@@ -808,7 +963,7 @@ get_plus_one([_, _, PlusOne]) ->
 %%      targeting this node with `Reason'.
 -spec kill_repairs([repair()], term()) -> ok.
 kill_repairs(Repairs, Reason) ->
-    [kill_repair(Repair, Reason) || Repair <- Repairs],
+    _ = [kill_repair(Repair, Reason) || Repair <- Repairs],
     ok.
 
 kill_repair(Repair, Reason) ->

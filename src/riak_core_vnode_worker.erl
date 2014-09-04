@@ -23,7 +23,14 @@
 -export([behaviour_info/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
         code_change/3]).
--export([start_link/1, handle_work/4]).
+-export([start_link/1, handle_work/3, handle_work/4]).
+
+-ifdef(PULSE).
+-compile(export_all).
+-compile({parse_transform, pulse_instrument}).
+-compile({pulse_replace_module, [{gen_fsm, pulse_gen_fsm},
+                                 {gen_server, pulse_gen_server}]}).
+-endif.
 
 -record(state, {
         module :: atom(),
@@ -39,19 +46,27 @@ behaviour_info(_Other) ->
 
 start_link(Args) ->
     WorkerMod = proplists:get_value(worker_callback_mod, Args),
-    [VNodeIndex, WorkerArgs, WorkerProps] = proplists:get_value(worker_args, Args),
-    gen_server:start_link(?MODULE, [WorkerMod, VNodeIndex, WorkerArgs, WorkerProps], []).
+    [VNodeIndex, WorkerArgs, WorkerProps, Caller] = proplists:get_value(worker_args, Args),
+    gen_server:start_link(?MODULE, [WorkerMod, VNodeIndex, WorkerArgs, WorkerProps, Caller], []).
 
-handle_work(Pid, Pool, Work, From) ->
-    gen_server:call(Pid, {work, Pool, Work, From}).
+handle_work(Worker, Work, From) ->
+    handle_work(Worker, Work, From, self()).
 
-init([Module, VNodeIndex, WorkerArgs, WorkerProps]) ->
+handle_work(Worker, Work, From, Caller) ->
+    gen_server:cast(Worker, {work, Work, From, Caller}).
+
+init([Module, VNodeIndex, WorkerArgs, WorkerProps, Caller]) ->
     {ok, WorkerState} = Module:init_worker(VNodeIndex, WorkerArgs, WorkerProps),
+    %% let the pool queue manager know there might be a worker to checkout
+    gen_fsm:send_all_state_event(Caller, worker_start),
     {ok, #state{module=Module, modstate=WorkerState}}.
 
-handle_call({work, Pool, Work, WorkFrom}, {Pid, _} = From, #state{module = Mod,
-        modstate = ModState} = State) ->
-    gen_server:reply(From, ok), %% unblock the caller
+handle_call(Event, _From, State) ->
+    lager:debug("Vnode worker received synchronous event: ~p.", [Event]),
+    {reply, ok, State}.
+
+handle_cast({work, Work, WorkFrom, Caller},
+            #state{module = Mod, modstate = ModState} = State) ->
     NewModState = case Mod:handle_work(Work, WorkFrom, ModState) of
         {reply, Reply, NS} ->
             riak_core_vnode:reply(WorkFrom, Reply),
@@ -60,12 +75,8 @@ handle_call({work, Pool, Work, WorkFrom}, {Pid, _} = From, #state{module = Mod,
             NS
     end,
     %% check the worker back into the pool
-    poolboy:checkin(Pool, self()),
-    gen_fsm:send_all_state_event(Pid, {checkin, self()}),
+    gen_fsm:send_all_state_event(Caller, {checkin, self()}),
     {noreply, State#state{modstate=NewModState}};
-handle_call(_Event, _From, State) ->
-    {reply, ok, State}.
-
 handle_cast(_Event, State) ->
     {noreply, State}.
 

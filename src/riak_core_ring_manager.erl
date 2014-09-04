@@ -21,16 +21,57 @@
 %% -------------------------------------------------------------------
 
 %% @doc the local view of the cluster's ring configuration
+%%
+%% Numerous processes concurrently read and access the ring in a
+%% variety of time sensitive code paths. To make this efficient,
+%% `riak_core' uses `mochiglobal' which exploits the Erlang constant
+%% pool to provide constant-time access to the ring without needing
+%% to copy data into individual process heaps.
+%%
+%% However, updating a `mochiglobal' value is very slow, and becomes slower
+%% the larger the item being stored. With large rings, the delay can
+%% become too long during periods of high ring churn, where hundreds of
+%% ring events are being triggered a second.
+%%
+%% As of Riak 1.4, `riak_core' uses a hybrid approach to solve this
+%% problem. When a ring is first written, it is written to a shared ETS
+%% table. If no ring events have occurred for 90 seconds, the ring is
+%% then promoted to `mochiglobal'.  This provides fast updates during
+%% periods of ring churn, while eventually providing very fast reads
+%% after the ring stabilizes. The downside is that reading from the ETS
+%% table before promotion is slower than `mochiglobal', and requires
+%% copying the ring into individual process heaps.
+%%
+%% To alleviate the slow down while in the ETS phase, `riak_core'
+%% exploits the fact that most time sensitive operations access the ring
+%% in order to read only a subset of its data: bucket properties and
+%% partition ownership. Therefore, these pieces of information are
+%% extracted from the ring and stored in the ETS table as well to
+%% minimize copying overhead. Furthermore, the partition ownership
+%% information (represented by the {@link chash} structure) is converted
+%% into a binary {@link chashbin} structure before being stored in the
+%% ETS table. This `chashbin' structure is fast to copy between processes
+%% due to off-heap binary sharing. Furthermore, this structure provides a
+%% secondary benefit of being much faster than the traditional `chash'
+%% structure for normal operations.
+%%
+%% As of Riak 1.4, it is therefore recommended that operations that
+%% can be performed by directly using the bucket properties API or
+%% `chashbin' structure do so using those methods rather than
+%% retrieving the ring via `get_my_ring/0' or `get_raw_ring/0'.
 
 -module(riak_core_ring_manager).
--include_lib("eunit/include/eunit.hrl").
 -define(RING_KEY, riak_ring).
--behaviour(gen_server2).
+-behaviour(gen_server).
 
 -export([start_link/0,
          start_link/1,
          get_my_ring/0,
          get_raw_ring/0,
+         get_raw_ring_chashbin/0,
+         get_chash_bin/0,
+         get_ring_id/0,
+         get_bucket_meta/1,
          refresh_my_ring/0,
          refresh_ring/2,
          set_my_ring/1,
@@ -50,58 +91,126 @@
 
 -record(state, {
         mode,
-        raw_ring
+        raw_ring,
+        ring_changed_time,
+        inactivity_timer
     }).
 
+-export([setup_ets/1, cleanup_ets/1, set_ring_global/1]). %% For EUnit testing
 -ifdef(TEST).
--export([set_ring_global/1]).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
+
+-define(ETS, ets_riak_core_ring_manager).
+
+-define(PROMOTE_TIMEOUT, 90000).
 
 %% ===================================================================
 %% Public API
 %% ===================================================================
 
 start_link() ->
-    gen_server2:start_link({local, ?MODULE}, ?MODULE, [live], []).
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [live], []).
 
 
 %% Testing entry point
 start_link(test) ->
-    gen_server2:start_link({local, ?MODULE}, ?MODULE, [test], []).
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [test], []).
 
 
 %% @spec get_my_ring() -> {ok, riak_core_ring:riak_core_ring()} | {error, Reason}
 get_my_ring() ->
-    case mochiglobal:get(?RING_KEY) of
+    Ring = case riak_core_mochiglobal:get(?RING_KEY) of
+               ets ->
+                   case ets:lookup(?ETS, ring) of
+                       [{_, RingETS}] ->
+                           RingETS;
+                       _ ->
+                           undefined
+                   end;
+               RingMochi ->
+                   RingMochi
+           end,
+    case Ring of
         Ring when is_tuple(Ring) -> {ok, Ring};
         undefined -> {error, no_ring}
     end.
 
 get_raw_ring() ->
-    gen_server2:call(?MODULE, get_raw_ring, infinity).
+    try
+        Ring = ets:lookup_element(?ETS, raw_ring, 2),
+        {ok, Ring}
+    catch
+        _:_ ->
+            gen_server:call(?MODULE, get_raw_ring, infinity)
+    end.
+
+get_raw_ring_chashbin() ->
+    try
+        Ring = ets:lookup_element(?ETS, raw_ring, 2),
+        {ok, CHBin} = get_chash_bin(),
+        {ok, Ring, CHBin}
+    catch
+        _:_ ->
+            gen_server:call(?MODULE, get_raw_ring_chashbin, infinity)
+    end.
 
 %% @spec refresh_my_ring() -> ok
 refresh_my_ring() ->
-    gen_server2:call(?MODULE, refresh_my_ring, infinity).
+    gen_server:call(?MODULE, refresh_my_ring, infinity).
 
 refresh_ring(Node, ClusterName) ->
-    gen_server2:cast({?MODULE, Node}, {refresh_my_ring, ClusterName}).
+    gen_server:cast({?MODULE, Node}, {refresh_my_ring, ClusterName}).
 
 %% @spec set_my_ring(riak_core_ring:riak_core_ring()) -> ok
 set_my_ring(Ring) ->
-    gen_server2:call(?MODULE, {set_my_ring, Ring}, infinity).
+    gen_server:call(?MODULE, {set_my_ring, Ring}, infinity).
 
+get_ring_id() ->
+    case ets:lookup(?ETS, id) of
+        [{_, Id}] ->
+            Id;
+        _ ->
+            {0,0}
+    end.
+
+%% @doc Return metadata for the given bucket. If a bucket
+%% for the non-default type is provided {error, no_type}
+%% is returned when the type does not exist
+get_bucket_meta({<<"default">>, Name}) ->
+    get_bucket_meta(Name);
+get_bucket_meta({_Type, _Name}=Bucket) ->
+    %% reads from cluster metadata ets table
+    %% these aren't stored in ring manager ever
+    riak_core_bucket:get_bucket(Bucket);
+get_bucket_meta(Bucket) ->
+    case ets:lookup(?ETS, {bucket, Bucket}) of
+        [] ->
+            undefined;
+        [{_, undefined}] ->
+            undefined;
+        [{_, Meta}] ->
+            {ok, Meta}
+    end.
+
+%% @doc Return the {@link chashbin} generated from the current ring
+get_chash_bin() ->
+    case ets:lookup(?ETS, chashbin) of
+        [{chashbin, CHBin}] ->
+            {ok, CHBin};
+        _ ->
+            {error, no_ring}
+    end.
 
 %% @spec write_ringfile() -> ok
 write_ringfile() ->
-    gen_server2:cast(?MODULE, write_ringfile).
+    gen_server:cast(?MODULE, write_ringfile).
 
 ring_trans(Fun, Args) ->
-    gen_server2:call(?MODULE, {ring_trans, Fun, Args}, infinity).
+    gen_server:call(?MODULE, {ring_trans, Fun, Args}, infinity).
 
 set_cluster_name(Name) ->
-    gen_server2:call(?MODULE, {set_cluster_name, Name}, infinity).
+    gen_server:call(?MODULE, {set_cluster_name, Name}, infinity).
 
 %% @doc Exposed for support/debug purposes. Forces the node to change its
 %%      ring in a manner that will trigger reconciliation on gossip.
@@ -115,21 +224,31 @@ force_update() ->
     ok.
 
 do_write_ringfile(Ring) ->
-    {{Year, Month, Day},{Hour, Minute, Second}} = calendar:universal_time(),
-    TS = io_lib:format(".~B~2.10.0B~2.10.0B~2.10.0B~2.10.0B~2.10.0B",
-                       [Year, Month, Day, Hour, Minute, Second]),
-    case app_helper:get_env(riak_core, ring_state_dir) of
+    case ring_dir() of
         "<nostore>" -> nop;
         Dir ->
+            {{Year, Month, Day},{Hour, Minute, Second}} = calendar:universal_time(),
+            TS = io_lib:format(".~B~2.10.0B~2.10.0B~2.10.0B~2.10.0B~2.10.0B",
+                               [Year, Month, Day, Hour, Minute, Second]),
             Cluster = app_helper:get_env(riak_core, cluster_name),
             FN = Dir ++ "/riak_core_ring." ++ Cluster ++ TS,
-            ok = filelib:ensure_dir(FN),
-            ok = file:write_file(FN, term_to_binary(Ring))
+            do_write_ringfile(Ring, FN)
     end.
+
+do_write_ringfile(Ring, FN) ->
+    ok = filelib:ensure_dir(FN),
+    try
+        ok = riak_core_util:replace_file(FN, term_to_binary(Ring))
+    catch
+        _:Err ->
+            lager:error("Unable to write ring to \"~s\" - ~p\n", [FN, Err]),
+            {error,Err}
+    end.
+
 
 %% @spec find_latest_ringfile() -> string()
 find_latest_ringfile() ->
-    Dir = app_helper:get_env(riak_core, ring_state_dir),
+    Dir = ring_dir(),
     case file:list_dir(Dir) of
         {ok, Filenames} ->
             Cluster = app_helper:get_env(riak_core, cluster_name),
@@ -157,7 +276,7 @@ read_ringfile(RingFile) ->
 
 %% @spec prune_ringfiles() -> ok | {error, Reason}
 prune_ringfiles() ->
-    case app_helper:get_env(riak_core, ring_state_dir) of
+    case ring_dir() of
         "<nostore>" -> ok;
         Dir ->
             Cluster = app_helper:get_env(riak_core, cluster_name),
@@ -167,7 +286,7 @@ prune_ringfiles() ->
                     {error, Reason};
                 {ok, []} -> ok;
                 {ok, Filenames} ->
-                    Timestamps = [TS || {"riak_core_ring", C1, TS} <- 
+                    Timestamps = [TS || {"riak_core_ring", C1, TS} <-
                      [list_to_tuple(string:tokens(FN, ".")) || FN <- Filenames],
                                         C1 =:= Cluster],
                     if Timestamps /= [] ->
@@ -181,11 +300,11 @@ prune_ringfiles() ->
                                          io_lib:format(
                                            "~B~2.10.0B~2.10.0B~2.10.0B~2.10.0B~2.10.0B",K))
                                        || K <- Keep],
-                            DelFNs = [Dir ++ "/" ++ FN || FN <- Filenames, 
-                                                          lists:all(fun(TS) -> 
+                            DelFNs = [Dir ++ "/" ++ FN || FN <- Filenames,
+                                                          lists:all(fun(TS) ->
                                                                             string:str(FN,TS)=:=0
                                                                     end, KeepTSs)],
-                            [file:delete(DelFN) || DelFN <- DelFNs],
+                            _ = [file:delete(DelFN) || DelFN <- DelFNs],
                             ok;
                        true ->
                             %% directory wasn't empty, but there are no ring
@@ -198,7 +317,7 @@ prune_ringfiles() ->
 
 %% @private (only used for test instances)
 stop() ->
-    gen_server2:cast(?MODULE, stop).
+    gen_server:cast(?MODULE, stop).
 
 
 %% ===================================================================
@@ -206,10 +325,11 @@ stop() ->
 %% ===================================================================
 
 init([Mode]) ->
+    setup_ets(Mode),
     Ring = reload_ring(Mode),
-    set_ring_global(Ring),
+    State = set_ring(Ring, #state{mode = Mode}),
     riak_core_ring_events:ring_update(Ring),
-    {ok, #state{mode = Mode, raw_ring=Ring}}.
+    {ok, State}.
 
 reload_ring(test) ->
     riak_core_ring:fresh(16,node());
@@ -221,11 +341,15 @@ reload_ring(live) ->
                     lager:critical("Failed to read ring file: ~p",
                                    [lager:posix_error(Reason)]),
                     throw({error, Reason});
-                Ring0 ->
+                Ring ->
                     %% Upgrade the ring data structure if necessary.
-                    lager:info("Upgrading legacy ring"),
-                    Ring = riak_core_ring:upgrade(Ring0),
-                    Ring
+                    case riak_core_ring:legacy_ring(Ring) of
+                        true ->
+                            lager:info("Upgrading legacy ring"),
+                            riak_core_ring:upgrade(Ring);
+                        false ->
+                            Ring
+                    end
             end;
         {error, not_found} ->
             lager:warning("No ring file available."),
@@ -238,48 +362,51 @@ reload_ring(live) ->
 
 handle_call(get_raw_ring, _From, #state{raw_ring=Ring} = State) ->
     {reply, {ok, Ring}, State};
+handle_call(get_raw_ring_chashbin, _From, #state{raw_ring=Ring} = State) ->
+    {ok, CHBin} = get_chash_bin(),
+    {reply, {ok, Ring, CHBin}, State};
 handle_call({set_my_ring, RingIn}, _From, State) ->
     Ring = riak_core_ring:upgrade(RingIn),
-    prune_write_notify_ring(Ring),
-    {reply,ok,State#state{raw_ring=Ring}};
+    State2 = prune_write_notify_ring(Ring, State),
+    {reply,ok,State2};
 handle_call(refresh_my_ring, _From, State) ->
     %% This node is leaving the cluster so create a fresh ring file
     FreshRing = riak_core_ring:fresh(),
-    set_ring_global(FreshRing),
+    State2 = set_ring(FreshRing, State),
     %% Make sure the fresh ring gets written before stopping
-    do_write_ringfile(FreshRing),
+    ok = do_write_ringfile(FreshRing),
 
     %% Handoff is complete and fresh ring is written
     %% so we can safely stop now.
     riak_core:stop("node removal completed, exiting."),
 
-    {reply,ok,State#state{raw_ring=FreshRing}};
+    {reply,ok,State2};
 handle_call({ring_trans, Fun, Args}, _From, State=#state{raw_ring=Ring}) ->
     case catch Fun(Ring, Args) of
         {new_ring, NewRing} ->
-            prune_write_notify_ring(NewRing),
+            State2 = prune_write_notify_ring(NewRing, State),
             riak_core_gossip:random_recursive_gossip(NewRing),
-            {reply, {ok, NewRing}, State#state{raw_ring=NewRing}};
+            {reply, {ok, NewRing}, State2};
         {set_only, NewRing} ->
-            prune_write_ring(NewRing),
-            {reply, {ok, NewRing}, State#state{raw_ring=NewRing}};
+            State2 = prune_write_ring(NewRing, State),
+            {reply, {ok, NewRing}, State2};
         {reconciled_ring, NewRing} ->
-            prune_write_notify_ring(NewRing),
+            State2 = prune_write_notify_ring(NewRing, State),
             riak_core_gossip:recursive_gossip(NewRing),
-            {reply, {ok, NewRing}, State#state{raw_ring=NewRing}};
+            {reply, {ok, NewRing}, State2};
         ignore ->
             {reply, not_changed, State};
         {ignore, Reason} ->
             {reply, {not_changed, Reason}, State};
         Other ->
-            lager:error("ring_trans: invalid return value: ~p", 
+            lager:error("ring_trans: invalid return value: ~p",
                                    [Other]),
             {reply, not_changed, State}
     end;
 handle_call({set_cluster_name, Name}, _From, State=#state{raw_ring=Ring}) ->
     NewRing = riak_core_ring:set_cluster_name(Ring, Name),
-    prune_write_notify_ring(NewRing),
-    {reply, ok, State#state{raw_ring=NewRing}}.
+    State2 = prune_write_notify_ring(NewRing, State),
+    {reply, ok, State2}.
 
 handle_cast(stop, State) ->
     {stop,normal,State};
@@ -300,10 +427,24 @@ handle_cast(write_ringfile, test) ->
     {noreply,test};
 
 handle_cast(write_ringfile, State=#state{raw_ring=Ring}) ->
-    do_write_ringfile(Ring),
+    ok = do_write_ringfile(Ring),
     {noreply,State}.
 
 
+handle_info(inactivity_timeout, State=#state{ring_changed_time=Then}) ->
+    DeltaUS = erlang:max(0, timer:now_diff(os:timestamp(), Then)),
+    DeltaMS = DeltaUS div 1000,
+    case DeltaMS >= ?PROMOTE_TIMEOUT of
+        true ->
+            lager:debug("Promoting ring after ~p", [DeltaMS]),
+            promote_ring(),
+            State2 = State#state{inactivity_timer=undefined},
+            {noreply, State2};
+        false ->
+            Remaining = ?PROMOTE_TIMEOUT - DeltaMS,
+            State2 = set_timer(Remaining, State),
+            {noreply, State2}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -321,6 +462,14 @@ code_change(_OldVsn, State, _Extra) ->
 %% ===================================================================
 %% Internal functions
 %% ===================================================================
+
+ring_dir() ->
+    case app_helper:get_env(riak_core, ring_state_dir) of
+        undefined ->
+            filename:join(app_helper:get_env(riak_core, platform_data_dir, "data"), "ring");
+        D ->
+            D
+    end.
 
 prune_list([X|Rest]) ->
     lists:usort(lists:append([[X],back(1,X,Rest),back(2,X,Rest),
@@ -353,8 +502,51 @@ run_fixups([{App, Fixup}|T], BucketName, BucketProps) ->
     end,
     run_fixups(T, BucketName, BP).
 
+set_ring(Ring, State) ->
+    set_ring_global(Ring),
+    Now = os:timestamp(),
+    State2 = State#state{raw_ring=Ring, ring_changed_time=Now},
+    State3 = maybe_set_timer(?PROMOTE_TIMEOUT, State2),
+    State3.
 
-%% Set the ring in mochiglobal.  Exported during unit testing
+maybe_set_timer(Duration, State=#state{inactivity_timer=undefined}) ->
+    set_timer(Duration, State);
+maybe_set_timer(_Duration, State) ->
+    State.
+
+set_timer(Duration, State) ->
+    Timer = erlang:send_after(Duration, self(), inactivity_timeout),
+    State#state{inactivity_timer=Timer}.
+
+setup_ets(Mode) ->
+    %% Destroy prior version of ETS table. This is necessary for certain
+    %% eunit tests, but is unneeded for normal Riak operation.
+    catch ets:delete(?ETS),
+    Access = case Mode of
+                 live -> protected;
+                 test -> public
+             end,
+    ?ETS = ets:new(?ETS, [named_table, Access, {read_concurrency, true}]),
+    Id = reset_ring_id(),
+    ets:insert(?ETS, [{changes, 0}, {promoted, 0}, {id, Id}]),
+    ok.
+
+cleanup_ets(test) ->
+    ets:delete(?ETS).
+
+reset_ring_id() ->
+    %% Maintain ring id epoch using mochiglobal to ensure ring id remains
+    %% monotonic even if the riak_core_ring_manager crashes and restarts
+    Epoch = case riak_core_mochiglobal:get(riak_ring_id_epoch) of
+                undefined ->
+                    0;
+                Value ->
+                    Value
+            end,
+    riak_core_mochiglobal:put(riak_ring_id_epoch, Epoch + 1),
+    {Epoch + 1, 0}.
+
+%% Set the ring in mochiglobal/ETS.  Exported during unit testing
 %% to make test setup simpler - no need to spin up a riak_core_ring_manager
 %% process.
 set_ring_global(Ring) ->
@@ -390,19 +582,53 @@ set_ring_global(Ring) ->
     %% Mark ring as tainted to check if it is ever leaked over gossip or
     %% relied upon for any non-local ring operations.
     TaintedRing = riak_core_ring:set_tainted(FixedRing),
-    %% store the modified ring in mochiglobal
-    mochiglobal:put(?RING_KEY, TaintedRing).
+
+    %% Extract bucket properties and place into ETS table. We want all bucket
+    %% additions, modifications, and deletions to appear in a single atomic
+    %% operation. Since ETS does not provide a means to change + delete
+    %% multiple values in a single operation, we emulate the deletion by
+    %% overwriting all deleted buckets with the "undefined" atom that has
+    %% special meaning in `riak_core_bucket:get_bucket_props/2`. We then
+    %% cleanup these values in a subsequent `ets:match_delete`.
+    OldBuckets = ets:select(?ETS, [{{{bucket, '$1'}, '_'}, [], ['$1']}]),
+    BucketDefaults = [{{bucket, Bucket}, undefined} || Bucket <- OldBuckets],
+    BucketMeta =
+        [{{bucket, Bucket}, Meta}
+         || Bucket <- riak_core_ring:get_buckets(TaintedRing),
+            {ok,Meta} <- [riak_core_ring:get_meta({bucket, Bucket}, TaintedRing)]],
+    BucketMeta2 = lists:ukeysort(1, BucketMeta ++ BucketDefaults),
+    CHBin = chashbin:create(riak_core_ring:chash(TaintedRing)),
+    {Epoch, Id} = ets:lookup_element(?ETS, id, 2),
+    Actions = [{ring, TaintedRing},
+               {raw_ring, Ring},
+               {id, {Epoch,Id+1}},
+               {chashbin, CHBin} | BucketMeta2],
+    ets:insert(?ETS, Actions),
+    ets:match_delete(?ETS, {{bucket, '_'}, undefined}),
+    case riak_core_mochiglobal:get(?RING_KEY) of
+        ets ->
+            ok;
+        _ ->
+            riak_core_mochiglobal:put(?RING_KEY, ets)
+    end,
+    ok.
+
+promote_ring() ->
+    {ok, Ring} = get_my_ring(),
+    riak_core_mochiglobal:put(?RING_KEY, Ring).
 
 %% Persist a new ring file, set the global value and notify any listeners
-prune_write_notify_ring(Ring) ->
-    prune_write_ring(Ring),
-    riak_core_ring_events:ring_update(Ring).
+prune_write_notify_ring(Ring, State) ->
+    State2 = prune_write_ring(Ring, State),
+    riak_core_ring_events:ring_update(Ring),
+    State2.
 
-prune_write_ring(Ring) ->
+prune_write_ring(Ring, State) ->
     riak_core_ring:check_tainted(Ring, "Error: Persisting tainted ring"),
-    riak_core_ring_manager:prune_ringfiles(),
-    do_write_ringfile(Ring),
-    set_ring_global(Ring).
+    ok = riak_core_ring_manager:prune_ringfiles(),
+    _ = do_write_ringfile(Ring),
+    State2 = set_ring(Ring, State),
+    State2.
 
 %% ===================================================================
 %% Unit tests
@@ -418,7 +644,7 @@ back_test() ->
     ?assertEqual([[7,8,9]], back(1, X, List2)),
     ?assertEqual([], back(1, X, List3)),
     ?assertEqual([[7,8,3]], back(2, X, List1)),
-    ?assertEqual([[11,12,13]], back(3, X, List1)).    
+    ?assertEqual([[11,12,13]], back(3, X, List1)).
 
 prune_list_test() ->
     TSList1 = [[2011,2,28,16,32,16],[2011,2,28,16,32,36],[2011,2,28,16,30,27],[2011,2,28,16,32,16],[2011,2,28,16,32,36]],
@@ -426,22 +652,28 @@ prune_list_test() ->
     PrunedList1 = [[2011,2,28,16,30,27],[2011,2,28,16,32,16]],
     PrunedList2 = [[2011,2,28,16,31,16],[2011,2,28,16,32,36]],
     ?assertEqual(PrunedList1, prune_list(TSList1)),
-    ?assertEqual(PrunedList2, prune_list(TSList2)).    
+    ?assertEqual(PrunedList2, prune_list(TSList2)).
 
 set_ring_global_test() ->
+    setup_ets(test),
     application:set_env(riak_core,ring_creation_size, 4),
     Ring = riak_core_ring:fresh(),
     set_ring_global(Ring),
-    ?assert(riak_core_ring:nearly_equal(Ring, mochiglobal:get(?RING_KEY))).
+    promote_ring(),
+    ?assert(riak_core_ring:nearly_equal(Ring, riak_core_mochiglobal:get(?RING_KEY))),
+    cleanup_ets(test).
 
 set_my_ring_test() ->
+    setup_ets(test),
     application:set_env(riak_core,ring_creation_size, 4),
     Ring = riak_core_ring:fresh(),
     set_ring_global(Ring),
     {ok, MyRing} = get_my_ring(),
-    ?assert(riak_core_ring:nearly_equal(Ring, MyRing)).
+    ?assert(riak_core_ring:nearly_equal(Ring, MyRing)),
+    cleanup_ets(test).
 
 refresh_my_ring_test() ->
+    setup_ets(test),
     Core_Settings = [{ring_creation_size, 4},
                      {ring_state_dir, "/tmp"},
                      {cluster_name, "test"}],
@@ -462,6 +694,32 @@ refresh_my_ring_test() ->
     [ok = application:set_env(riak_core, AppKey, get({?MODULE, AppKey}))
      || {AppKey, _Val} <- Core_Settings],
     ok.
+
+-define(TEST_RINGDIR, "ring_manager_eunit").
+-define(TEST_RINGFILE, (?TEST_RINGDIR ++ "/test.ring")).
+-define(TMP_RINGFILE,  (?TEST_RINGFILE ++ ".tmp")).
+do_write_ringfile_test() ->
+    %% Make sure no data exists from previous runs
+    file:change_mode(?TMP_RINGFILE, 8#00644),
+    file:delete(?TMP_RINGFILE),
+    file:change_mode(?TEST_RINGFILE, 8#00644),
+    file:delete(?TEST_RINGFILE),
+
+    %% Check happy path
+    GenR = fun(Name) -> riak_core_ring:fresh(64, Name) end,
+    ?assertEqual(ok, do_write_ringfile(GenR(happy), ?TEST_RINGFILE)),
+
+    %% Check write fails (create .tmp file with no write perms)
+    ok = file:write_file(?TMP_RINGFILE, <<"no write for you">>),
+    ok = file:change_mode(?TMP_RINGFILE, 8#00444),
+    ?assertMatch({error,_}, do_write_ringfile(GenR(tmp_perms), ?TEST_RINGFILE)),
+    ok = file:change_mode(?TMP_RINGFILE, 8#00644),
+    ok = file:delete(?TMP_RINGFILE),
+
+    %% Check rename fails
+    ok = file:change_mode(?TEST_RINGDIR, 8#00444),
+    ?assertMatch({error,_}, do_write_ringfile(GenR(ring_perms), ?TEST_RINGFILE)),
+    ok = file:change_mode(?TEST_RINGDIR, 8#00755).
 
 -endif.
 

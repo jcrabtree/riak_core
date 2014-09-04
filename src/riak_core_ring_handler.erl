@@ -20,6 +20,7 @@
 %% gen_event callbacks
 -export([init/1, handle_event/2, handle_call/2,
          handle_info/2, terminate/2, code_change/3]).
+-export([ensure_vnodes_started/1]).
 -record(state, {}).
 
 
@@ -33,11 +34,10 @@ init([]) ->
     ensure_vnodes_started(Ring),
     {ok, #state{}}.
 
+
 handle_event({ring_update, Ring}, State) ->
-    %% Make sure all vnodes are started...
-    ensure_vnodes_started(Ring),
-    riak_core_vnode_manager:ring_changed(Ring),
-    riak_core_capability:ring_changed(Ring),
+    maybe_start_vnode_proxies(Ring),
+    maybe_stop_vnode_proxies(Ring),
     {ok, State}.
 
 handle_call(_Event, State) ->
@@ -73,16 +73,11 @@ ensure_vnodes_started(Ring) ->
                         {true, _, _, _} ->
                             riak_core_ring_manager:refresh_my_ring();
                         {_, true, [], leaving} ->
-                            riak_core_ring_manager:ring_trans(
-                              fun(Ring2, _) -> 
-                                      Ring3 = riak_core_ring:exit_member(node(), Ring2, node()),
-                                      {new_ring, Ring3}
-                              end, []),
-                            %% Shutdown if we are the only node in the cluster
-                            case riak_core_ring:random_other_node(Ring) of
-                                no_node ->
-                                    riak_core_ring_manager:refresh_my_ring();
-                                _ ->
+                            case ready_to_exit(AppMods) of
+                                true ->
+                                    exit_ring_trans(),
+                                    maybe_shutdown(Ring);
+                                false ->
                                     ok
                             end;
                         {_, _, _, invalid} ->
@@ -95,6 +90,33 @@ ensure_vnodes_started(Ring) ->
                     end;
                 _ -> ok
             end
+    end.
+
+%% Shutdown if we are the only node in the cluster
+maybe_shutdown(Ring) ->
+    case riak_core_ring:random_other_node(Ring) of
+        no_node ->
+            riak_core_ring_manager:refresh_my_ring();
+        _ ->
+            ok
+    end.
+
+exit_ring_trans() ->
+    riak_core_ring_manager:ring_trans(
+        fun(Ring2, _) -> 
+                Ring3 = riak_core_ring:exit_member(node(), Ring2, node()),
+                {new_ring, Ring3}
+        end, []).
+
+ready_to_exit([]) ->
+    true;
+ready_to_exit([{_App, Mod} | AppMods]) ->
+    case erlang:function_exported(Mod, ready_to_exit, 0) andalso
+             (not Mod:ready_to_exit()) of 
+        true ->
+            false;
+        false ->
+            ready_to_exit(AppMods)
     end.
 
 ensure_vnodes_started([], _Ring, Acc) ->
@@ -121,20 +143,30 @@ ensure_vnodes_started({App,Mod}, Ring) ->
                        end,
 
                        %% Let the app finish starting...
-                       case riak_core:wait_for_application(App) of
-                           ok ->
-                               %% Start the vnodes.
-                               [Mod:start_vnode(I) || I <- Startable],
+                       ok = riak_core:wait_for_application(App),
 
-                               %% Mark the service as up.
-                               SupName = list_to_atom(atom_to_list(App) ++ "_sup"),
-                               SupPid = erlang:whereis(SupName),
-                               riak_core_node_watcher:service_up(App, SupPid),
-                               exit(normal);
-                           {error, Reason} ->
-                               lager:critical("Failed to start application: ~p", [App]),
-                               throw({error, Reason})
-                       end
+                       %% Start the vnodes.
+                       HasStartVnodes = lists:member({start_vnodes, 1},
+                                                     Mod:module_info(exports)),
+                       case HasStartVnodes of
+                           true ->
+                               Mod:start_vnodes(Startable);
+                           false ->
+                               [Mod:start_vnode(I) || I <- Startable]
+                       end,
+
+                       %% Mark the service as up.
+                       SupName = list_to_atom(atom_to_list(App) ++ "_sup"),
+                       SupPid = erlang:whereis(SupName),
+                       case riak_core:health_check(App) of
+                           undefined ->
+                               riak_core_node_watcher:service_up(App, SupPid);
+                           HealthMFA ->
+                               riak_core_node_watcher:service_up(App,
+                                                                 SupPid,
+                                                                 HealthMFA)
+                       end,
+                       exit(normal)
                end),
     Startable.
 
@@ -158,4 +190,33 @@ startable_vnodes(Mod, Ring) ->
                 RO ->
                     [RO | riak_core_ring:my_indices(Ring)]
             end
+    end.
+
+maybe_start_vnode_proxies(Ring) ->
+    Mods = [M || {_,M} <- riak_core:vnode_modules()],
+    Size = riak_core_ring:num_partitions(Ring),
+    FutureSize = riak_core_ring:future_num_partitions(Ring),
+    Larger = Size < FutureSize,
+    case Larger of
+        true ->
+            FutureIdxs = riak_core_ring:all_owners(riak_core_ring:future_ring(Ring)),
+            _ = [riak_core_vnode_proxy_sup:start_proxy(Mod, Idx) || {Idx, _} <- FutureIdxs,
+                                                                Mod <- Mods],
+            ok;
+        false ->
+            ok
+    end.
+
+maybe_stop_vnode_proxies(Ring) ->
+    Mods = [M || {_, M} <- riak_core:vnode_modules()],
+    case riak_core_ring:pending_changes(Ring) of
+        [] ->
+            Idxs = [{I,M} || {I,_} <- riak_core_ring:all_owners(Ring), M <- Mods],
+            ProxySpecs = supervisor:which_children(riak_core_vnode_proxy_sup),
+            Running = [{I,M} || {{M,I},_,_,_} <- ProxySpecs, lists:member(M, Mods)],
+            ToShutdown = Running -- Idxs,
+            _ = [riak_core_vnode_proxy_sup:stop_proxy(M,I) || {I, M} <- ToShutdown],
+            ok;
+        _ ->
+            ok
     end.

@@ -25,8 +25,29 @@
 -module(riak_core_test_util).
 
 -ifdef(TEST).
--export([setup_mockring1/0]).
+-export([setup_mockring1/0,
+         fake_ring/2,
+         stop_pid/1,
+         wait_for_pid/1]).
 -include_lib("eunit/include/eunit.hrl").
+
+stop_pid(Other) when not is_pid(Other) ->
+    ok;
+stop_pid(Pid) ->
+    unlink(Pid),
+    exit(Pid, shutdown),
+    ok = wait_for_pid(Pid).
+
+wait_for_pid(Pid) ->
+    Mref = erlang:monitor(process, Pid),
+    receive
+        {'DOWN', Mref, process, _, _} ->
+            ok
+    after
+        5000 ->
+            {error, didnotexit}
+    end.
+
 
 setup_mockring1() ->
     % requires a running riak_core_ring_manager, in test-mode is ok
@@ -45,5 +66,25 @@ setup_mockring1() ->
                                  'othernode2@otherhost2', R) end,
                        Ring3,[1,2,3,4,5,6]),
     riak_core_ring_manager:set_ring_global(Ring).
+
+fake_ring(Size, NumNodes) ->
+    ManyNodes = [list_to_atom("dev" ++ integer_to_list(X) ++ "@127.0.0.1")
+                 || _ <- lists:seq(0, Size div NumNodes),
+                    X <- lists:seq(1, NumNodes)],
+    Nodes = lists:sublist(ManyNodes, Size),
+    Inc = chash:ring_increment(Size),
+    Indices = lists:seq(0, (Size-1)*Inc, Inc),
+    Owners = lists:zip(Indices, Nodes),
+    [Node|OtherNodes] = Nodes,
+    Ring = riak_core_ring:fresh(Size, Node),
+    Ring2 = lists:foldl(fun(OtherNode, RingAcc) ->
+                                RingAcc2 = riak_core_ring:add_member(Node, RingAcc, OtherNode),
+                                riak_core_ring:set_member(Node, RingAcc2, OtherNode,
+                                                          valid, same_vclock)
+                        end, Ring, OtherNodes),
+    Ring3 = lists:foldl(fun({Idx, Owner}, RingAcc) ->
+                                riak_core_ring:transfer_node(Idx, Owner, RingAcc)
+                        end, Ring2, Owners),
+    Ring3.
 
 -endif. %TEST.

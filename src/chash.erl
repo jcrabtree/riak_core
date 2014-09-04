@@ -33,8 +33,6 @@
 %% New York, NY, USA
 
 -module(chash).
--author('Justin Sheehy <justin@basho.com>').
--author('Andy Gross <andy@basho.com>').
 
 -export([contains_name/2,
          fresh/2,
@@ -52,7 +50,7 @@
          successors/3,
          update/3]).
 
--export_type([chash/0]).
+-export_type([chash/0, index/0, index_as_int/0]).
     
 -define(RINGTOP, trunc(math:pow(2,160)-1)).  % SHA-1 space
 
@@ -67,10 +65,10 @@
 -type chash_node() :: term().
 %% Indices into the ring, used as keys for object location, are binary
 %% representations of 160-bit integers.
--type index() :: binary().
+-type index() :: <<_:160>>.
 -type index_as_int() :: integer().
 -type node_entry() :: {index_as_int(), chash_node()}.
--type num_partitions() :: integer().
+-type num_partitions() :: pos_integer().
 
 %% ===================================================================
 %% Public API
@@ -99,12 +97,20 @@ lookup(IndexAsInt, CHash) ->
     {IndexAsInt, X} = proplists:lookup(IndexAsInt, Nodes),
     X.
 
+-ifndef(old_hash).
+sha(Bin) ->
+    crypto:hash(sha, Bin).
+-else.
+sha(Bin) ->
+    crypto:sha(Bin).
+-endif.
+
 %% @doc Given any term used to name an object, produce that object's key
 %%      into the ring.  Two names with the same SHA-1 hash value are
 %%      considered the same name.
 -spec key_of(ObjectName :: term()) -> index().
 key_of(ObjectName) ->    
-    crypto:sha(term_to_binary(ObjectName)).
+    sha(term_to_binary(ObjectName)).
 
 %% @doc Return all Nodes that own any partitions in the ring.
 -spec members(CHash :: chash()) -> [chash_node()].
@@ -145,14 +151,16 @@ ordered_from(Index, {NumPartitions, Nodes}) ->
 
 %% @doc Given an object key, return all NodeEntries in reverse order
 %%      starting at Index.
--spec predecessors(Index :: index(), CHash :: chash()) -> [node_entry()].
+-spec predecessors(Index :: index() | index_as_int(), CHash :: chash()) -> [node_entry()].
 predecessors(Index, CHash) ->
     {NumPartitions, _Nodes} = CHash,
     predecessors(Index, CHash, NumPartitions).
 %% @doc Given an object key, return the next N NodeEntries in reverse order
 %%      starting at Index.
--spec predecessors(Index :: index(), CHash :: chash(), N :: integer())
+-spec predecessors(Index :: index() | index_as_int(), CHash :: chash(), N :: integer())
                   -> [node_entry()].
+predecessors(Index, CHash, N) when is_integer(Index) ->
+    predecessors(<<Index:160/integer>>, CHash, N);
 predecessors(Index, CHash, N) ->
     Num = max_n(N, CHash),
     {Res, _} = lists:split(Num, lists:reverse(ordered_from(Index,CHash))),

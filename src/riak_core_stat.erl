@@ -42,8 +42,8 @@ start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 register_stats() ->
-    [(catch folsom_metrics:delete_metric({?APP, Name})) || {Name, _Type} <- stats()],
-    [register_stat({?APP, Name}, Type) || {Name, Type} <- stats()],
+    _ = [(catch folsom_metrics:delete_metric({?APP, Name})) || {Name, _Type} <- stats()],
+    _ = [register_stat({?APP, Name}, Type) || {Name, Type} <- stats()],
     riak_core_stat_cache:register_app(?APP, {?MODULE, produce_stats, []}).
 
 %% @spec get_stats() -> proplist()
@@ -58,7 +58,7 @@ get_stats() ->
 update(Arg) ->
     gen_server:cast(?SERVER, {update, Arg}).
 
-% @spec produce_stats(state(), integer()) -> proplist()
+%% @spec produce_stats() -> proplist()
 %% @doc Produce a proplist-formatted view of the current aggregation
 %%      of stats.
 produce_stats() ->
@@ -75,7 +75,7 @@ handle_call(_Req, _From, State) ->
     {reply, ok, State}.
 
 handle_cast({update, Arg}, State) ->
-    update1(Arg),
+    ok = update1(Arg),
     {noreply, State};
 handle_cast(_Req, State) ->
     {noreply, State}.
@@ -89,7 +89,7 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-%% @spec update(term()) -> ok
+%% @spec update1(term()) -> ok
 %% @doc Update the given stat.
 update1(rejected_handoffs) ->
     folsom_metrics:notify_existing_metric({?APP, rejected_handoffs}, {inc, 1}, counter);
@@ -105,6 +105,9 @@ update1(gossip_received) ->
 
 update1(rings_reconciled) ->
     folsom_metrics:notify_existing_metric({?APP, rings_reconciled}, 1, spiral);
+
+update1(dropped_vnode_requests) ->
+    folsom_metrics:notify_existing_metric({?APP, dropped_vnode_requests_total}, {inc, 1}, counter);
 
 update1(converge_timer_begin) ->
     folsom_metrics:notify_existing_metric({?APP, converge_delay}, timer_start, duration);
@@ -123,6 +126,7 @@ stats() ->
      {gossip_received, spiral},
      {rejected_handoffs, counter},
      {handoff_timeouts, counter},
+     {dropped_vnode_requests_total, counter},
      {converge_delay, duration},
      {rebalance_delay, duration}].
 
@@ -134,36 +138,50 @@ register_stat(Name, duration) ->
     folsom_metrics:new_duration(Name).
 
 gossip_stats() ->
-    lists:flatten([backwards_compat(Stat, Type, folsom_metrics:get_metric_value({?APP, Stat})) ||
+    lists:flatten([backwards_compat(Stat, Type, riak_core_stat_q:calc_stat({{?APP, Stat}, Type})) ||
                       {Stat, Type} <- stats(), Stat /= riak_core_rejected_handoffs]).
 
+backwards_compat(Name, Type, unavailable) when Type =/= counter ->
+    backwards_compat(Name, Type, []);
 backwards_compat(rings_reconciled, spiral, Stats) ->
-    [{rings_reconciled_total, proplists:get_value(count, Stats)},
-    {rings_reconciled, trunc(proplists:get_value(one, Stats))}];
+    [{rings_reconciled_total, proplists:get_value(count, Stats, unavailable)},
+    {rings_reconciled, safe_trunc(proplists:get_value(one, Stats, unavailable))}];
 backwards_compat(gossip_received, spiral, Stats) ->
-    {gossip_received, trunc(proplists:get_value(one, Stats))};
+    {gossip_received, safe_trunc(proplists:get_value(one, Stats, unavailable))};
 backwards_compat(Name, counter, Stats) ->
     {Name, Stats};
 backwards_compat(Name, duration, Stats) ->
-    [{join(Name, min), trunc(proplists:get_value(min, Stats))},
-     {join(Name, max), trunc(proplists:get_value(max, Stats))},
-     {join(Name, mean), trunc(proplists:get_value(arithmetic_mean, Stats))},
-     {join(Name, last), proplists:get_value(last, Stats)}].
+    [{join(Name, min), safe_trunc(proplists:get_value(min, Stats, unavailable))},
+     {join(Name, max), safe_trunc(proplists:get_value(max, Stats, unavailable))},
+     {join(Name, mean), safe_trunc(proplists:get_value(arithmetic_mean, Stats, unavailable))},
+     {join(Name, last), proplists:get_value(last, Stats, unavailable)}].
 
 join(Atom1, Atom2) ->
     Bin1 = atom_to_binary(Atom1, latin1),
     Bin2 = atom_to_binary(Atom2, latin1),
     binary_to_atom(<<Bin1/binary, $_, Bin2/binary>>, latin1).
 
+safe_trunc(N) when is_number(N) ->
+    trunc(N);
+safe_trunc(X) ->
+    X.
+
 %% Provide aggregate stats for vnode queues.  Compute instantaneously for now,
 %% may need to cache if stats are called heavily (multiple times per seconds)
 vnodeq_stats() ->
-    VnodesInfo = [{Service, element(2, erlang:process_info(Pid, message_queue_len))} ||
+    VnodesInfo = [{Service, vnodeq_len(Pid)} ||
                      {Service, _Index, Pid} <- riak_core_vnode_manager:all_vnodes()],
     ServiceInfo = lists:foldl(fun({S,MQL}, A) ->
                                       orddict:append_list(S, [MQL], A)
                               end, orddict:new(), VnodesInfo),
     lists:flatten([vnodeq_aggregate(S, MQLs) || {S, MQLs} <- ServiceInfo]).
+
+vnodeq_len(Pid) ->
+    try
+        element(2, erlang:process_info(Pid, message_queue_len))
+    catch _:_ ->
+            0
+    end.
 
 vnodeq_aggregate(_Service, []) ->
     []; % no vnodes, no stats

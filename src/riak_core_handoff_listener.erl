@@ -41,7 +41,7 @@ start_link() ->
     gen_nb_server:start_link(?MODULE, IpAddr, PortNum, [IpAddr, PortNum, SslOpts]).
 
 get_handoff_ip() ->
-    gen_server2:call(?MODULE, handoff_ip, infinity).
+    riak_core_gen_server:call(?MODULE, handoff_ip, infinity).
 
 init([IpAddr, PortNum, SslOpts]) ->
     register(?MODULE, self()),
@@ -76,7 +76,7 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 new_connection(Socket, State = #state{ssl_opts = SslOpts}) ->
     case riak_core_handoff_manager:add_inbound(SslOpts) of
         {ok, Pid} ->
-            gen_tcp:controlling_process(Socket, Pid),
+            ok = gen_tcp:controlling_process(Socket, Pid),
             ok = riak_core_handoff_receiver:set_socket(Pid, Socket),
             {ok, State};
         {error, _Reason} ->

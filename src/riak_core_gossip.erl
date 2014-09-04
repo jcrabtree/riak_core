@@ -44,10 +44,6 @@
 
 -include("riak_core_ring.hrl").
 
--ifdef(TEST).
--include_lib("eunit/include/eunit.hrl").
--endif.
-
 %% Default gossip rate: allow at most 45 gossip messages every 10 seconds
 -define(DEFAULT_LIMIT, {45, 10000}).
 
@@ -85,24 +81,17 @@ rejoin(Node, Ring) ->
     gen_server:cast({?MODULE, Node}, {rejoin, Ring}).
 
 legacy_gossip() ->
-    gen_server:call(?MODULE, legacy_gossip).
+    false.
 
-legacy_gossip(Node) ->
-    gen_server:call(?MODULE, {legacy_gossip, Node}).
+legacy_gossip(_Node) ->
+    false.
 
 %% @doc Determine if any of the `Nodes' are using legacy gossip by querying
 %%      each node's capability directly over RPC. The proper way to check
-%%      for legacy gossip is to use {@link legacy/gossip/1}. This function
+%%      for legacy gossip is to use {@link legacy_gossip/1}. This function
 %%      is used to support staged clustering in `riak_core_claimant'.
-any_legacy_gossip(_Ring, []) ->
-    false;
-any_legacy_gossip(Ring, [Node|Nodes]) ->
-    case rpc_gossip_version(Ring, Node) of
-        ?LEGACY_RING_VSN ->
-            true;
-        _ ->
-            any_legacy_gossip(Ring, Nodes)
-    end.
+any_legacy_gossip(_Ring, _Nodes) ->
+    false.
 
 %% @doc Gossip state to a random node in the ring.
 random_gossip(Ring) ->
@@ -125,7 +114,7 @@ recursive_gossip(Ring, Node) ->
     Nodes = riak_core_ring:active_members(Ring),
     Tree = riak_core_util:build_tree(2, Nodes, [cycles]),
     Children = orddict:fetch(Node, Tree),
-    [send_ring(node(), OtherNode) || OtherNode <- Children],
+    _ = [send_ring(node(), OtherNode) || OtherNode <- Children],
     ok.
 recursive_gossip(Ring) ->
     %% A non-active member will not show-up in the tree decomposition
@@ -157,17 +146,6 @@ init(_State) ->
                                          gossip_tokens=Tokens}),
     {ok, State}.
 
-handle_call(legacy_gossip, _From, State) ->
-    {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
-    Reply = check_legacy_gossip(Ring, State),
-    {reply, Reply, State};
-
-handle_call({legacy_gossip, Node}, _From, State) ->
-    {ok, MyRing} = riak_core_ring_manager:get_raw_ring(),
-    State2 = update_known_versions(MyRing, State),
-    Reply = known_legacy_gossip(Node, State2),
-    {reply, Reply, State2};
-
 handle_call(_, _From, State) ->
     {reply, ok, State}.
 
@@ -183,29 +161,8 @@ update_gossip_version(Ring) ->
             Ring2
     end.
 
-known_legacy_gossip(Node, State) ->
-    case orddict:find(Node, State#state.gossip_versions) of
-        error ->
-            true;
-        {ok, ?LEGACY_RING_VSN} ->
-            true;
-        _ ->
-            false
-    end.
-
-check_legacy_gossip(Ring, State) ->
-    {ok, MyRing} = riak_core_ring_manager:get_raw_ring(),
-    State2 = update_known_versions(MyRing, State),
-    case riak_core_ring:legacy_ring(Ring) of
-        true ->
-            true;
-        false ->
-            %% If any member is using legacy gossip, then we use legacy gossip.
-            Members = riak_core_ring:all_members(Ring),
-            Legacy = [known_legacy_gossip(Node, State2) || Node <- Members],
-            Result = lists:any(fun(E) -> E =:= true end, Legacy),
-            Result
-    end.
+check_legacy_gossip(_Ring, _State) ->
+    false.
 
 update_known_version(Node, {OtherRing, GVsns}) ->
     case riak_core_ring:get_member_meta(OtherRing, Node, gossip_vsn) of
@@ -226,20 +183,17 @@ update_known_versions(OtherRing, State=#state{gossip_versions=GVsns}) ->
                               {OtherRing, GVsns},
                               riak_core_ring:all_members(OtherRing)),
     State#state{gossip_versions=GVsns2}.
-    
+
 gossip_version() ->
-    case app_helper:get_env(riak_core, legacy_gossip) of
-        true ->
-            ?LEGACY_RING_VSN;
-        _ ->
-            ?CURRENT_RING_VSN
-    end.
+    %% Now that we can safely assume all nodes support capabilities, this
+    %% should be replaced with a capability someday.
+    ?CURRENT_RING_VSN.
 
 rpc_gossip_version(Ring, Node) ->
     GossipVsn = riak_core_ring:get_member_meta(Ring, Node, gossip_vsn),
     case GossipVsn of
         undefined ->
-            case rpc:call(Node, riak_core_gossip, gossip_version, [], 1000) of
+            case riak_core_util:safe_rpc(Node, riak_core_gossip, gossip_version, [], 1000) of
                 {badrpc, _} ->
                     ?LEGACY_RING_VSN;
                 Vsn ->
@@ -301,12 +255,6 @@ handle_cast({reconcile_ring, RingIn}, State) ->
             {noreply, State2}
     end;
 
-handle_cast(reset_tokens, State) ->
-    schedule_next_reset(),
-    gen_server:cast(?MODULE, gossip_ring),
-    {Tokens, _} = app_helper:get_env(riak_core, gossip_limit, ?DEFAULT_LIMIT),
-    {noreply, State#state{gossip_tokens=Tokens}};
-
 handle_cast(gossip_ring, State) ->
     % Gossip the ring to some random other node...
     {ok, MyRing} = riak_core_ring_manager:get_raw_ring(),
@@ -317,13 +265,18 @@ handle_cast(gossip_ring, State) ->
 handle_cast({rejoin, RingIn}, State) ->
     OtherRing = riak_core_ring:upgrade(RingIn),
     {ok, Ring} = riak_core_ring_manager:get_raw_ring(),
-    SameCluster = (riak_core_ring:cluster_name(Ring) =:= 
+    SameCluster = (riak_core_ring:cluster_name(Ring) =:=
                        riak_core_ring:cluster_name(OtherRing)),
     case SameCluster of
         true ->
             Legacy = check_legacy_gossip(Ring, State),
             OtherNode = riak_core_ring:owner_node(OtherRing),
-            riak_core:join(Legacy, node(), OtherNode, true, true),
+            case riak_core:join(Legacy, node(), OtherNode, true, true) of
+                ok -> ok;
+                {error, Reason} ->
+                    lager:error("Could not rejoin cluster: ~p", [Reason]),
+                    ok
+            end,
             {noreply, State};
         false ->
             {noreply, State}
@@ -332,7 +285,12 @@ handle_cast({rejoin, RingIn}, State) ->
 handle_cast(_, State) ->
     {noreply, State}.
 
-%% @private
+handle_info(reset_tokens, State) ->
+    schedule_next_reset(),
+    gen_server:cast(?MODULE, gossip_ring),
+    {Tokens, _} = app_helper:get_env(riak_core, gossip_limit, ?DEFAULT_LIMIT),
+    {noreply, State#state{gossip_tokens=Tokens}};
+
 handle_info(_Info, State) -> {noreply, State}.
 
 %% @private
@@ -350,7 +308,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 schedule_next_reset() ->
     {_, Reset} = app_helper:get_env(riak_core, gossip_limit, ?DEFAULT_LIMIT),
-    timer:apply_after(Reset, gen_server, cast, [?MODULE, reset_tokens]).
+    erlang:send_after(Reset, ?MODULE, reset_tokens).
 
 reconcile(Ring0, [OtherRing0]) ->
     %% Due to rolling upgrades and legacy gossip, a ring's cluster name
@@ -398,34 +356,45 @@ reconcile(Ring0, [OtherRing0]) ->
     end.
 
 log_membership_changes(OldRing, NewRing) ->
-    OldStatus = orddict:from_list(riak_core_ring:all_member_status(OldRing)),
-    NewStatus = orddict:from_list(riak_core_ring:all_member_status(NewRing)),
+    OldStatus = riak_core_ring:all_member_status(OldRing),
+    NewStatus = riak_core_ring:all_member_status(NewRing),
 
-    %% Pad both old and new status to the same length
-    OldDummyStatus = [{Node, undefined} || {Node, _} <- NewStatus],
-    OldStatus2 = orddict:merge(fun(_, Status, _) ->
-                                       Status
-                               end, OldStatus, OldDummyStatus),
+    do_log_membership_changes(lists:sort(OldStatus), lists:sort(NewStatus)).
 
-    NewDummyStatus = [{Node, undefined} || {Node, _} <- OldStatus],
-    NewStatus2 = orddict:merge(fun(_, Status, _) ->
-                                       Status
-                               end, NewStatus, NewDummyStatus),
+do_log_membership_changes([], []) ->
+    ok;
+do_log_membership_changes([{Node, Status}|Old], [{Node, Status}|New]) ->
+    %% No change
+    do_log_membership_changes(Old, New);
+do_log_membership_changes([{Node, Status1}|Old], [{Node, Status2}|New]) ->
+    %% State changed, did not join or leave
+    log_node_changed(Node, Status1, Status2),
+    do_log_membership_changes(Old, New);
+do_log_membership_changes([{OldNode, _OldStatus}|_]=Old, [{NewNode, NewStatus}|New]) when NewNode < OldNode->
+    %% Node added
+    log_node_added(NewNode, NewStatus),
+    do_log_membership_changes(Old, New);
+do_log_membership_changes([{OldNode, OldStatus}|Old], [{NewNode, _NewStatus}|_]=New) when OldNode < NewNode ->
+    %% Node removed
+    log_node_removed(OldNode, OldStatus),
+    do_log_membership_changes(Old, New);
+do_log_membership_changes([{OldNode, OldStatus}|Old], []) ->
+    %% Trailing nodes were removed
+    log_node_removed(OldNode, OldStatus),
+    do_log_membership_changes(Old, []);
+do_log_membership_changes([], [{NewNode, NewStatus}|New]) ->
+    %% Trailing nodes were added
+    log_node_added(NewNode, NewStatus),
+    do_log_membership_changes([], New).
 
-    %% Merge again to determine changed status
-    orddict:merge(fun(_, Same, Same) ->
-                          Same;
-                     (Node, undefined, New) ->
-                          lager:info("'~s' joined cluster with status '~s'~n",
-                                     [Node, New]);
-                     (Node, Old, undefined) ->
-                          lager:info("'~s' removed from cluster (previously: "
-                                     "'~s')~n", [Node, Old]);
-                     (Node, Old, New) ->
-                          lager:info("'~s' changed from '~s' to '~s'~n",
-                                     [Node, Old, New])
-                  end, OldStatus2, NewStatus2),
-    ok.
+log_node_changed(Node, Old, New) ->
+    lager:info("'~s' changed from '~s' to '~s'~n", [Node, Old, New]).
+
+log_node_added(Node, New) ->
+    lager:info("'~s' joined cluster with status '~s'~n", [Node, New]).
+
+log_node_removed(Node, Old) ->
+    lager:info("'~s' removed from cluster (previously: '~s')~n", [Node, Old]).
 
 remove_from_cluster(Ring, ExitingNode) ->
     remove_from_cluster(Ring, ExitingNode, erlang:now()).
@@ -475,7 +444,7 @@ attempt_simple_transfer(Seed, Ring, [{P, Exit}|Rest], TargetN, Exit, Idx, Last) 
                                            fun({_, Owner}) -> Node /= Owner end,
                                            Rest))
                           end,
-            case lists:filter(fun(N) -> 
+            case lists:filter(fun(N) ->
                                  Next = StepsToNext(N),
                                  (Next+1 >= TargetN)
                                           orelse (Next == length(Rest))

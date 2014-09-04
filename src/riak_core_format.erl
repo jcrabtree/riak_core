@@ -23,7 +23,12 @@
 -module(riak_core_format).
 -export([fmt/2,
          human_size_fmt/2,
-         human_time_fmt/2]).
+         human_time_fmt/2,
+         epoch_to_datetime/1]).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
 
 %% @doc Created a string `Str' based on the format string `FmtStr' and
 %%      list of args `Args'.
@@ -33,7 +38,7 @@ fmt(FmtStr, Args) ->
 
 %% @doc Create a human friendly string `Str' for number of bytes
 %%      `Bytes' and format based on format string `Fmt'.
--spec human_size_fmt(string(), non_neg_integer()) -> Str::string().
+-spec human_size_fmt(string(), number()) -> string().
 human_size_fmt(Fmt, Bytes) ->
     Fmt2 = Fmt ++ " ~s",
     {Value, Units} = human_size(Bytes, ["B","KB","MB","GB","TB","PB"]),
@@ -48,6 +53,13 @@ human_time_fmt(Fmt, Micros) ->
     {Value, Units} = human_time(Micros),
     fmt(Fmt2, [Value, Units]).
 
+%% @doc Convert a folsom_utils:now_epoch() to a universal datetime
+-spec epoch_to_datetime(non_neg_integer()) -> calendar:datetime().
+epoch_to_datetime(S) ->
+    Epoch = {{1970,1,1},{0,0,0}},
+    Seconds = calendar:datetime_to_gregorian_seconds(Epoch) + S,
+    calendar:gregorian_seconds_to_datetime(Seconds).
+
 %%%===================================================================
 %%% Private
 %%%===================================================================
@@ -57,7 +69,7 @@ human_time_fmt(Fmt, Micros) ->
 %% @doc Formats a byte size into a human-readable size with units.
 %%      Thanks StackOverflow:
 %%      http://stackoverflow.com/questions/2163691/simpler-way-to-format-bytesize-in-a-human-readable-way
--spec human_size(non_neg_integer(), list()) -> iolist().
+-spec human_size(number(), list()) -> {float(), iolist()}.
 human_size(S, [_|[_|_] = L]) when S >= 1024 -> human_size(S/1024, L);
 human_size(S, [M|_]) ->
     {float(S), M}.
@@ -68,12 +80,29 @@ human_size(S, [M|_]) ->
 %%      duration in the form of `{Value, Units}'.
 -spec human_time(non_neg_integer()) -> {Value::number(), Units::string()}.
 human_time(Micros) ->
-    human_time(Micros, {1000, "us"}, [{1000, "ms"}, {1000, "s"}, {60, "min"}, {60, "hr"}, {24, "d"}]).
+    human_time(Micros, {1000, "us"}, [{1000, "ms"}, {60, "s"}, {60, "min"}, {24, "hr"}, {365, "d"}]).
 
--spec human_time(non_neg_integer(), {pos_integer(), string()},
+-spec human_time(number(), {pos_integer(), string()},
                  [{pos_integer(), string()}]) ->
-                        {number(), string()}.
+                        {float(), string()}.
 human_time(T, {Divisor, Unit}, Units) when T < Divisor orelse Units == [] ->
     {float(T), Unit};
 human_time(T, {Divisor, _}, [Next|Units]) ->
     human_time(T / Divisor, Next, Units).
+
+-ifdef(TEST).
+human_time_fmt_test() ->
+    FiveUS  = 5,
+    FiveMS  = 5000,
+    FiveS   = 5000000,
+    FiveMin = FiveS * 60,
+    FiveHr  = FiveMin * 60,
+    FiveDay = FiveHr * 24,
+    [?assertEqual(Expect, human_time_fmt("~.1f", T))
+     || {T, Expect} <- [{FiveUS,  "5.0 us"},
+                        {FiveMS,  "5.0 ms"},
+                        {FiveS,   "5.0 s"},
+                        {FiveMin, "5.0 min"},
+                        {FiveHr,  "5.0 hr"},
+                        {FiveDay, "5.0 d"}]].
+-endif.

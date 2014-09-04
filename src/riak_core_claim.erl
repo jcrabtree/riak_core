@@ -411,7 +411,8 @@ choose_claim_v3(Ring, _ClaimNode, Params) ->
         undefined ->
             ok;
         _ ->
-            random:seed(OldSeed)
+            {_,_,_} = random:seed(OldSeed),
+            ok
     end,
 
     lager:debug("Claim3 metrics: ~p\n", [NewMetrics]),
@@ -454,7 +455,7 @@ claim_v3(Wants, Owners, Params) ->
             NIs = build_nis(Wants, Owners),
 
             lager:debug("claim3 - NIs\n",[]),
-            [lager:debug("  ~p\n", [NI]) || NI <- NIs],
+            _ = [lager:debug("  ~p\n", [NI]) || NI <- NIs],
 
             %% Generate plans that resolve violations and overloads
             Plans = lists:usort(make_plans(Trials, NIs, Q, TN)),
@@ -1076,9 +1077,11 @@ circular_distance(I1, I2, Q) ->
 -ifdef(TEST).
 
 wants_claim_test() ->
+    riak_core_ring_manager:setup_ets(test),
     riak_core_test_util:setup_mockring1(),
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     ?assertEqual({yes, 1}, default_wants_claim(Ring)),
+    riak_core_ring_manager:cleanup_ets(test),
     riak_core_ring_manager:stop().
 
 find_biggest_hole_test() ->

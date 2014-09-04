@@ -22,7 +22,7 @@
 -module(riak_core).
 -export([stop/0, stop/1, join/1, join/5, staged_join/1, remove/1, down/1,
          leave/0, remove_from_cluster/1]).
--export([vnode_modules/0]).
+-export([vnode_modules/0, health_check/1]).
 -export([register/1, register/2, bucket_fixups/0, bucket_validators/0]).
 -export([stat_mods/0]).
 
@@ -81,7 +81,7 @@ join(false, _, Node, Rejoin, Auto) ->
         pang ->
             {error, not_reachable};
         pong ->
-            case rpc:call(Node, riak_core_gossip, legacy_gossip, []) of
+            case false of
                 true ->
                     legacy_join(Node);
                 _ ->
@@ -93,13 +93,13 @@ join(false, _, Node, Rejoin, Auto) ->
     end.
 
 get_other_ring(Node) ->
-    case rpc:call(Node, riak_core_ring_manager, get_my_ring, []) of
+    case riak_core_util:safe_rpc(Node, riak_core_ring_manager, get_my_ring, []) of
         {ok, Ring} ->
             case riak_core_ring:legacy_ring(Ring) of
                 true ->
                     {ok, Ring};
                 false ->
-                    rpc:call(Node, riak_core_ring_manager, get_raw_ring, [])
+                    riak_core_util:safe_rpc(Node, riak_core_ring_manager, get_raw_ring, [])
             end;
         Error ->
             Error
@@ -159,12 +159,14 @@ legacy_join(Node) when is_atom(Node) ->
     {ok, OurRingSize} = application:get_env(riak_core, ring_creation_size),
     case net_adm:ping(Node) of
         pong ->
-            case rpc:call(Node,
+            case riak_core_util:safe_rpc(Node,
                           application,
                           get_env,
                           [riak_core, ring_creation_size]) of
                 {ok, OurRingSize} ->
                     riak_core_gossip:send_ring(Node, node());
+                {badrpc, rpc_process_down} ->
+                    {error, not_reachable};
                 _ ->
                     {error, different_ring_sizes}
             end;
@@ -296,6 +298,19 @@ stat_mods() ->
         {ok, Mods} -> Mods
     end.
 
+health_check(App) ->
+    case application:get_env(riak_core, health_checks) of
+        undefined ->
+            undefined;
+        {ok, Mods} ->
+            case lists:keyfind(App, 1, Mods) of
+                false ->
+                    undefined;
+                {App, MFA} ->
+                    MFA
+            end
+    end.
+
 %% Get the application name if not supplied, first by get_application
 %% then by searching by module name
 get_app(undefined, Module) ->
@@ -329,15 +344,23 @@ register(App, [{repl_helper, FixupMod}|T]) ->
 register(App, [{vnode_module, VNodeMod}|T]) ->
     register_mod(get_app(App, VNodeMod), VNodeMod, vnode_modules),
     register(App, T);
+register(App, [{health_check, HealthMFA}|T]) ->
+    register_metadata(get_app(App, HealthMFA), HealthMFA, health_checks),
+    register(App, T);
 register(App, [{bucket_validator, ValidationMod}|T]) ->
     register_mod(get_app(App, ValidationMod), ValidationMod, bucket_validators),
     register(App, T);
 register(App, [{stat_mod, StatMod}|T]) ->
     register_mod(App, StatMod, stat_mods),
+    register(App, T);
+register(App, [{permissions, Permissions}|T]) ->
+    register_mod(App, Permissions, permissions),
+    register(App, T);
+register(App, [{auth_mod, {AuthType, AuthMod}}|T]) ->
+    register_proplist({AuthType, AuthMod}, auth_mods),
     register(App, T).
 
-
-register_mod(App, Module, Type) when is_atom(Module), is_atom(Type) ->
+register_mod(App, Module, Type) when is_atom(Type) ->
     case Type of
         vnode_modules ->
             riak_core_vnode_proxy_sup:start_proxies(Module);
@@ -353,6 +376,27 @@ register_mod(App, Module, Type) when is_atom(Module), is_atom(Type) ->
             application:set_env(riak_core, Type,
                 lists:usort([{App,Module}|Mods]))
     end.
+
+register_metadata(App, Value, Type) ->
+    case application:get_env(riak_core, Type) of
+        undefined ->
+            application:set_env(riak_core, Type, [{App,Value}]);
+        {ok, Values} ->
+            application:set_env(riak_core, Type,
+                lists:usort([{App,Value}|Values]))
+    end.
+
+register_proplist({Key, Value}, Type) ->
+    case application:get_env(riak_core, Type) of
+        undefined ->
+            application:set_env(riak_core, Type, [{Key, Value}]);
+        {ok, Values} ->
+            application:set_env(riak_core, Type, lists:keystore(Key, 1,
+                                                                Values,
+                                                                {Key, Value}))
+    end.
+
+
 
 %% @spec add_guarded_event_handler(HandlerMod, Handler, Args) -> AddResult
 %%       HandlerMod = module()

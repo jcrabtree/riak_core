@@ -3,6 +3,7 @@
 -define(PT_MSG_OLDSYNC, 2).
 -define(PT_MSG_SYNC, 3).
 -define(PT_MSG_CONFIGURE, 4).
+-define(PT_MSG_BATCH, 5).
 
 -record(ho_stats,
         {
@@ -13,11 +14,11 @@
         }).
 
 -type ho_stats() :: #ho_stats{}.
--type ho_type() :: ownership_handoff | hinted_handoff | repair.
+-type ho_type() :: ownership_handoff | hinted_handoff | repair | resize_transfer.
 -type predicate() :: fun((any()) -> boolean()).
 
--type index() :: integer().
--type mod_src_tgt() :: {module(), index(), index()}.
+-type index() :: chash:index_as_int().
+-type mod_src_tgt() :: {module(), index(), index()} | {undefined, undefined, undefined}.
 -type mod_partition() :: {module(), index()}.
 
 -record(handoff_status,
@@ -34,6 +35,7 @@
           vnode_mon             :: reference(),
           type                  :: ho_type(),
           req_origin            :: node(),
-          filter_mod_fun        :: {module(), atom()}
+          filter_mod_fun        :: {module(), atom()},
+          size                  :: {function(), dynamic} | {non_neg_integer(), bytes | objects}
         }).
 -type handoff_status() :: #handoff_status{}.

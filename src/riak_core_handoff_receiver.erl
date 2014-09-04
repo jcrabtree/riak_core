@@ -22,86 +22,110 @@
 
 -module(riak_core_handoff_receiver).
 -include("riak_core_handoff.hrl").
--behaviour(gen_server2).
+-behaviour(riak_core_gen_server).
 -export([start_link/0,                          % Don't use SSL
          start_link/1,                          % SSL options list, empty=no SSL
-         set_socket/2]).
+         set_socket/2,
+         supports_batching/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 -record(state, {sock :: port(),
+                peer :: term(),
                 ssl_opts :: [] | list(),
                 tcp_mod :: atom(),
+                timeout_len :: non_neg_integer(),
                 partition :: non_neg_integer(),
                 vnode_mod = riak_kv_vnode:: module(),
                 vnode :: pid(),
                 count = 0 :: non_neg_integer()}).
 
+%% set the timeout to five minutes to be conservative.
+-define(RECV_TIMEOUT, 300000).
 
 start_link() ->
     start_link([]).
 
 start_link(SslOpts) ->
-    gen_server2:start_link(?MODULE, [SslOpts], []).
+    riak_core_gen_server:start_link(?MODULE, [SslOpts], []).
 
 set_socket(Pid, Socket) ->
-    gen_server2:call(Pid, {set_socket, Socket}).
+    riak_core_gen_server:call(Pid, {set_socket, Socket}).
+
+supports_batching() ->
+    true.
 
 init([SslOpts]) ->
     {ok, #state{ssl_opts = SslOpts,
                 tcp_mod  = if SslOpts /= [] -> ssl;
                               true          -> gen_tcp
-                           end}}.
+                           end,
+                timeout_len = app_helper:get_env(riak_core, handoff_receive_timeout, ?RECV_TIMEOUT)}}.
 
 handle_call({set_socket, Socket0}, _From, State = #state{ssl_opts = SslOpts}) ->
     SockOpts = [{active, once}, {packet, 4}, {header, 1}],
     Socket = if SslOpts /= [] ->
                      {ok, Skt} = ssl:ssl_accept(Socket0, SslOpts, 30*1000),
                      ok = ssl:setopts(Skt, SockOpts),
+                     Peer = safe_peername(Skt, ssl),
                      Skt;
                 true ->
                      ok = inet:setopts(Socket0, SockOpts),
+                     Peer = safe_peername(Socket0, inet),
                      Socket0
              end,
-    {reply, ok, State#state { sock = Socket }}.
+    {reply, ok, State#state { sock = Socket, peer = Peer }}.
 
-handle_info({tcp_closed,_Socket},State=#state{partition=Partition,count=Count}) ->
+handle_info({tcp_closed,_Socket},State=#state{partition=Partition,count=Count,
+                                              peer=Peer}) ->
     lager:info("Handoff receiver for partition ~p exited after processing ~p"
-                          " objects", [Partition, Count]),
+                          " objects from ~p", [Partition, Count, Peer]),
     {stop, normal, State};
-handle_info({tcp_error, _Socket, _Reason}, State=#state{partition=Partition,count=Count}) ->
+handle_info({tcp_error, _Socket, _Reason}, State=#state{partition=Partition,count=Count,
+                                                        peer=Peer}) ->
     lager:info("Handoff receiver for partition ~p exited after processing ~p"
-                          " objects", [Partition, Count]),
+                          " objects from ~p", [Partition, Count, Peer]),
     {stop, normal, State};
 handle_info({tcp, Socket, Data}, State) ->
     [MsgType|MsgData] = Data,
     case catch(process_message(MsgType, MsgData, State)) of
         {'EXIT', Reason} ->
             lager:error("Handoff receiver for partition ~p exited abnormally after "
-                                   "processing ~p objects: ~p", [State#state.partition, State#state.count, Reason]),
+                                   "processing ~p objects from ~p: ~p", [State#state.partition, State#state.count, State#state.peer, Reason]),
             {stop, normal, State};
         NewState when is_record(NewState, state) ->
             InetMod = if NewState#state.ssl_opts /= [] -> ssl;
                          true                          -> inet
                       end,
             InetMod:setopts(Socket, [{active, once}]),
-            {noreply, NewState}
+            {noreply, NewState, State#state.timeout_len}
     end;
 handle_info({ssl_closed, Socket}, State) ->
     handle_info({tcp_closed, Socket}, State);
 handle_info({ssl_error, Socket, Reason}, State) ->
     handle_info({tcp_error, Socket, Reason}, State);
 handle_info({ssl, Socket, Data}, State) ->
-    handle_info({tcp, Socket, Data}, State).
+    handle_info({tcp, Socket, Data}, State);
+handle_info(timeout, State) ->
+            lager:error("Handoff receiver for partition ~p timed out after "
+                                   "processing ~p objects from ~p.", [State#state.partition, State#state.count, State#state.peer]),
+    {stop, normal, State}.
 
-process_message(?PT_MSG_INIT, MsgData, State=#state{vnode_mod=VNodeMod}) ->
+process_message(?PT_MSG_INIT, MsgData, State=#state{vnode_mod=VNodeMod,
+                                                    peer=Peer}) ->
     <<Partition:160/integer>> = MsgData,
-    lager:info("Receiving handoff data for partition ~p:~p", [VNodeMod, Partition]),
+    lager:info("Receiving handoff data for partition ~p:~p from ~p", [VNodeMod, Partition, Peer]),
     {ok, VNode} = riak_core_vnode_master:get_vnode_pid(Partition, VNodeMod),
     Data = [{mod_src_tgt, {VNodeMod, undefined, Partition}},
             {vnode_pid, VNode}],
     riak_core_handoff_manager:set_recv_data(self(), Data),
     State#state{partition=Partition, vnode=VNode};
+
+process_message(?PT_MSG_BATCH, MsgData, State) ->
+    lists:foldl(fun(Obj, StateAcc) -> process_message(?PT_MSG_OBJ, Obj, StateAcc) end, 
+                State,
+                binary_to_term(MsgData));
+
 process_message(?PT_MSG_OBJ, MsgData, State=#state{vnode=VNode, count=Count}) ->
     Msg = {handoff_data, MsgData},
     case gen_fsm:sync_send_all_state_event(VNode, Msg, 60000) of
@@ -134,3 +158,11 @@ handle_cast(_Msg, State) -> {noreply, State}.
 terminate(_Reason, _State) -> ok.
 
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
+
+safe_peername(Skt, Mod) ->
+    case Mod:peername(Skt) of
+        {ok, {Host, Port}} ->
+            {inet_parse:ntoa(Host), Port};
+        _ ->
+            {unknown, unknown}                  % Real info is {Addr, Port}
+    end.

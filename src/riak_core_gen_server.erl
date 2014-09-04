@@ -1,22 +1,22 @@
 %% This file is a copy of gen_server.erl from the R13B-1 Erlang/OTP
 %% distribution, with the following modifications:
 %%
-%% 1) the module name is gen_server2
+%% 1) the module name is riak_core_gen_server
 %%
 %% 2) more efficient handling of selective receives in callbacks
-%% gen_server2 processes drain their message queue into an internal
+%% riak_core_gen_server processes drain their message queue into an internal
 %% buffer before invoking any callback module functions. Messages are
 %% dequeued from the buffer for processing. Thus the effective message
-%% queue of a gen_server2 process is the concatenation of the internal
+%% queue of a riak_core_gen_server process is the concatenation of the internal
 %% buffer and the real message queue.
 %% As a result of the draining, any selective receive invoked inside a
 %% callback is less likely to have to scan a large message queue.
 %%
-%% 3) gen_server2:cast is guaranteed to be order-preserving
+%% 3) riak_core_gen_server:cast is guaranteed to be order-preserving
 %% The original code could reorder messages when communicating with a
 %% process on a remote node that was not currently connected.
 %%
-%% 4) The new functions gen_server2:pcall/3, pcall/4, and pcast/3
+%% 4) The new functions riak_core_gen_server:pcall/3, pcall/4, and pcast/3
 %% allow callers to attach priorities to requests. Requests with
 %% higher priorities are processed before requests with lower
 %% priorities. The default priority is 0.
@@ -57,7 +57,7 @@
 %% 
 %%     $Id$
 %%
--module(gen_server2).
+-module(riak_core_gen_server).
 
 %%% ---------------------------------------------------
 %%%
@@ -135,7 +135,6 @@
 	 multi_call/2, multi_call/3, multi_call/4,
 	 enter_loop/3, enter_loop/4, enter_loop/5, wake_hib/7]).
 
--export([behaviour_info/1]).
 
 %% System exports
 -export([system_continue/3,
@@ -152,15 +151,32 @@
 %%%  API
 %%%=========================================================================
 
--ifdef(use_specs).
--spec behaviour_info(atom()) -> 'undefined' | [{atom(), any()}].
--endif.
-
-behaviour_info(callbacks) ->
-    [{init,1},{handle_call,3},{handle_cast,2},{handle_info,2},
-     {terminate,2},{code_change,3}];
-behaviour_info(_Other) ->
-    undefined.
+-callback init(Args :: term()) ->
+    {ok, State :: term()} | {ok, State :: term(), timeout() | hibernate} |
+    {stop, Reason :: term()} | ignore.
+-callback handle_call(Request :: term(), From :: {pid(), Tag :: term()},
+                      State :: term()) ->
+    {reply, Reply :: term(), NewState :: term()} |
+    {reply, Reply :: term(), NewState :: term(), timeout() | hibernate} |
+    {noreply, NewState :: term()} |
+    {noreply, NewState :: term(), timeout() | hibernate} |
+    {stop, Reason :: term(), Reply :: term(), NewState :: term()} |
+    {stop, Reason :: term(), NewState :: term()}.
+-callback handle_cast(Request :: term(), State :: term()) ->
+    {noreply, NewState :: term()} |
+    {noreply, NewState :: term(), timeout() | hibernate} |
+    {stop, Reason :: term(), NewState :: term()}.
+-callback handle_info(Info :: timeout | term(), State :: term()) ->
+    {noreply, NewState :: term()} |
+    {noreply, NewState :: term(), timeout() | hibernate} |
+    {stop, Reason :: term(), NewState :: term()}.
+-callback terminate(Reason :: (normal | shutdown | {shutdown, term()} |
+                               term()),
+                    State :: term()) ->
+    term().
+-callback code_change(OldVsn :: (term() | {down, term()}), State :: term(),
+                      Extra :: term()) ->
+    {ok, NewState :: term()} | {error, Reason :: term()}.
 
 %%%  -----------------------------------------------------------------
 %%% Starts a generic server.
@@ -334,7 +350,7 @@ enter_loop(Mod, Options, State, ServerName, Timeout) ->
     Name = get_proc_name(ServerName),
     Parent = get_parent(),
     Debug = debug_options(Name, Options),
-    Queue = priority_queue:new(),
+    Queue = riak_core_priority_queue:new(),
     {Timeout1, TimeoutState} = build_timeout_state(Timeout),
     loop(Parent, Name, State, Mod, Timeout1, TimeoutState, Queue, Debug).
 
@@ -354,7 +370,7 @@ init_it(Starter, self, Name, Mod, Args, Options) ->
 init_it(Starter, Parent, Name0, Mod, Args, Options) ->
     Name = name(Name0),
     Debug = debug_options(Name, Options),
-    Queue = priority_queue:new(),
+    Queue = riak_core_priority_queue:new(),
     case catch Mod:init(Args) of
 	{ok, State} ->
 	    proc_lib:init_ack(Starter, {ok, self()}), 	    
@@ -419,7 +435,7 @@ loop(Parent, Name, State, Mod, hibernate, undefined, Queue, Debug) ->
 loop(Parent, Name, State, Mod, hibernate, {Current, Min, undefined}, Queue,
      Debug) ->
     proc_lib:hibernate(?MODULE,wake_hib,[Parent, Name, State, Mod,
-                                         {Current, Min, now()}, Queue, Debug]);
+                                         {Current, Min, os:timestamp()}, Queue, Debug]);
 loop(Parent, Name, State, Mod, Time, TimeoutState, Queue, Debug) ->
     receive
         Input -> loop(Parent, Name, State, Mod,
@@ -431,7 +447,7 @@ loop(Parent, Name, State, Mod, Time, TimeoutState, Queue, Debug) ->
 
 process_next_msg(Parent, Name, State, Mod, Time, TimeoutState, Queue,
                  Debug, Hib) ->
-    case priority_queue:out(Queue) of
+    case riak_core_priority_queue:out(Queue) of
         {{value, Msg}, Queue1} ->
             process_msg(Parent, Name, State, Mod,
                         Time, TimeoutState, Queue1, Debug, Hib, Msg);
@@ -462,7 +478,7 @@ wake_hib(Parent, Name, State, Mod, TimeoutState, Queue, Debug) ->
 adjust_hibernate_after(undefined) ->
     undefined;
 adjust_hibernate_after({Current, Min, HibernatedAt}) ->
-    NapLengthMicros = timer:now_diff(now(), HibernatedAt),
+    NapLengthMicros = timer:now_diff(os:timestamp(), HibernatedAt),
     CurrentMicros = Current * 1000,
     LowTargetMicros = CurrentMicros * 4,
     HighTargetMicros = LowTargetMicros * 4,
@@ -481,11 +497,11 @@ adjust_hibernate_after({Current, Min, HibernatedAt}) ->
     end.
 
 in({'$gen_pcast', {Priority, Msg}}, Queue) ->
-    priority_queue:in({'$gen_cast', Msg}, Priority, Queue);
+    riak_core_priority_queue:in({'$gen_cast', Msg}, Priority, Queue);
 in({'$gen_pcall', From, {Priority, Msg}}, Queue) ->
-    priority_queue:in({'$gen_call', From, Msg}, Priority, Queue);
+    riak_core_priority_queue:in({'$gen_call', From, Msg}, Priority, Queue);
 in(Input, Queue) ->
-    priority_queue:in(Input, Queue).
+    riak_core_priority_queue:in(Input, Queue).
 
 process_msg(Parent, Name, State, Mod, Time, TimeoutState, Queue,
             Debug, _Hib, Msg) ->
@@ -502,7 +518,7 @@ process_msg(Parent, Name, State, Mod, Time, TimeoutState, Queue,
 	_Msg when Debug =:= [] ->
 	    handle_msg(Msg, Parent, Name, State, Mod, TimeoutState, Queue);
 	_Msg ->
-	    Debug1 = sys:handle_debug(Debug, {?MODULE, print_event}, 
+	    Debug1 = sys:handle_debug(Debug, fun print_event/3,
 				      Name, {in, Msg}),
 	    handle_msg(Msg, Parent, Name, State, Mod, TimeoutState, Queue,
                        Debug1)
@@ -608,7 +624,7 @@ rec_nodes(Tag, [N|Tail], Name, Badnodes, Replies, Time, TimerId) ->
 	    %% Collect all replies that already have arrived
 	    rec_nodes_rest(Tag, Tail, Name, [N | Badnodes], Replies)
     after Time ->
-	    case rpc:call(N, erlang, whereis, [Name]) of
+	    case riak_core_util:safe_rpc(N, erlang, whereis, [Name]) of
 		Pid when is_pid(Pid) -> % It exists try again.
 		    rec_nodes(Tag, [N|Tail], Name, Badnodes,
 			      Replies, infinity, TimerId);
@@ -740,18 +756,18 @@ handle_msg({'$gen_call', From, Msg},
 	    Debug1 = reply(Name, From, Reply, NState, Debug),
 	    loop(Parent, Name, NState, Mod, Time1, TimeoutState, Queue, Debug1);
 	{noreply, NState} ->
-	    Debug1 = sys:handle_debug(Debug, {?MODULE, print_event}, Name,
+	    Debug1 = sys:handle_debug(Debug, fun print_event/3, Name,
 				      {noreply, NState}),
 	    loop(Parent, Name, NState, Mod, infinity, TimeoutState, Queue,
                  Debug1);
 	{noreply, NState, Time1} ->
-	    Debug1 = sys:handle_debug(Debug, {?MODULE, print_event}, Name,
+	    Debug1 = sys:handle_debug(Debug, fun print_event/3, Name,
 				      {noreply, NState}),
 	    loop(Parent, Name, NState, Mod, Time1, TimeoutState, Queue, Debug1);
 	{stop, Reason, Reply, NState} ->
 	    {'EXIT', R} = 
 		(catch terminate(Reason, Name, Msg, Mod, NState, Debug)),
-	    reply(Name, From, Reply, NState, Debug),
+	    _ = reply(Name, From, Reply, NState, Debug),
 	    exit(R);
 	Other ->
 	    handle_common_reply(Other, Parent, Name, Msg, Mod, State,
@@ -782,12 +798,12 @@ handle_common_reply(Reply, Parent, Name, Msg, Mod, State, TimeoutState, Queue,
                     Debug) ->
     case Reply of
 	{noreply, NState} ->
-	    Debug1 = sys:handle_debug(Debug, {?MODULE, print_event}, Name,
+	    Debug1 = sys:handle_debug(Debug, fun print_event/3, Name,
 				      {noreply, NState}),
 	    loop(Parent, Name, NState, Mod, infinity, TimeoutState, Queue,
                  Debug1);
 	{noreply, NState, Time1} ->
-	    Debug1 = sys:handle_debug(Debug, {?MODULE, print_event}, Name,
+	    Debug1 = sys:handle_debug(Debug, fun print_event/3, Name,
 				      {noreply, NState}),
 	    loop(Parent, Name, NState, Mod, Time1, TimeoutState, Queue, Debug1);
 	{stop, Reason, NState} ->
@@ -800,7 +816,7 @@ handle_common_reply(Reply, Parent, Name, Msg, Mod, State, TimeoutState, Queue,
 
 reply(Name, {To, Tag}, Reply, State, Debug) ->
     reply({To, Tag}, Reply),
-    sys:handle_debug(Debug, {?MODULE, print_event}, Name, 
+    sys:handle_debug(Debug, fun print_event/3, Name,
 		     {out, Reply, To, State} ).
 
 
@@ -810,10 +826,8 @@ reply(Name, {To, Tag}, Reply, State, Debug) ->
 system_continue(Parent, Debug, [Name, State, Mod, Time, TimeoutState, Queue]) ->
     loop(Parent, Name, State, Mod, Time, TimeoutState, Queue, Debug).
 
--ifdef(use_specs).
--spec system_terminate(_, _, _, [_]) -> no_return().
--endif.
 
+-spec system_terminate(_, _, _, [_]) -> no_return().
 system_terminate(Reason, _Parent, Debug, [Name, State, Mod, _Time,
                                           _TimeoutState, _Queue]) ->
     terminate(Reason, Name, [], Mod, State, Debug).
@@ -956,7 +970,7 @@ get_proc_name({local, Name}) ->
 	    exit(process_not_registered)
     end;    
 get_proc_name({global, Name}) ->
-    case global:safe_whereis_name(Name) of
+    case global:whereis_name(Name) of
 	undefined ->
 	    exit(process_not_registered_globally);
 	Pid when Pid =:= self() ->
@@ -978,7 +992,7 @@ get_parent() ->
 name_to_pid(Name) ->
     case whereis(Name) of
 	undefined ->
-	    case global:safe_whereis_name(Name) of
+	    case global:whereis_name(Name) of
 		undefined ->
 		    exit(could_not_find_registerd_name);
 		Pid ->
@@ -1022,5 +1036,5 @@ format_status(Opt, StatusData) ->
      {data, [{"Status", SysState},
 	     {"Parent", Parent},
 	     {"Logged events", Log},
-             {"Queued messages", priority_queue:to_list(Queue)}]} |
+             {"Queued messages", riak_core_priority_queue:to_list(Queue)}]} |
      Specfic1].

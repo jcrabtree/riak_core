@@ -40,8 +40,6 @@
 
 -module(riak_core_dtrace).
 
--include_lib("eunit/include/eunit.hrl").
-
 -export([dtrace/1, dtrace/3, dtrace/4, dtrace/6]).
 -export([enabled/0, put_tag/1]).
 -export([timeit0/1, timeit_mg/1, timeit_best/1]).   % debugging/testing only
@@ -129,12 +127,7 @@ put_tag(Tag) ->
         true ->
             FTag = iolist_to_binary(Tag),
             put(?DTRACE_TAG_KEY, FTag),
-            case get(?MAGIC) of
-                dtrace ->
-                    dtrace:put_utag(FTag);
-                dyntrace ->
-                    dyntrace:put_tag(FTag)
-            end;
+            dyntrace:put_tag(FTag);
         false ->
             ok
     end.
@@ -153,26 +146,26 @@ timeit0(ArgList) ->
     end.
 
 timeit_mg(ArgList) ->
-    case mochiglobal:get(?MAGIC) of
+    case riak_core_mochiglobal:get(?MAGIC) of
         undefined ->
             case application:get_env(riak_core, dtrace_support) of
                 {ok, true} ->
                     case string:to_float(erlang:system_info(version)) of
                         {5.8, _} ->
                             %% R14B04
-                            mochiglobal:put(?MAGIC, dtrace),
+                            riak_core_mochiglobal:put(?MAGIC, dtrace),
                             timeit_mg(ArgList);
                         {Num, _} when Num > 5.8 ->
                             %% R15B or higher, though dyntrace option
                             %% was first available in R15B01.
-                            mochiglobal:put(?MAGIC, dyntrace),
+                            riak_core_mochiglobal:put(?MAGIC, dyntrace),
                             timeit_mg(ArgList);
                         _ ->
-                            mochiglobal:put(?MAGIC, unsupported),
+                            riak_core_mochiglobal:put(?MAGIC, unsupported),
                             false
                     end;
                 _ ->
-                    mochiglobal:put(?MAGIC, unsupported),
+                    riak_core_mochiglobal:put(?MAGIC, unsupported),
                     false
             end;
         dyntrace ->
@@ -187,6 +180,7 @@ timeit_best(ArgList) ->
     dtrace(ArgList).
 
 -ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
 timeit_naive_test() ->
     test_common("timeit_naive",
@@ -198,16 +192,16 @@ timeit_naive_test() ->
 -define(REPS, 225000).
 
 timeit_mochiglobal_test() ->
-    mochiglobal:delete(?MAGIC),
+    riak_core_mochiglobal:delete(?MAGIC),
     Reps = lists:seq(1, ?REPS),
     test_common("timeit_mochiglobal",
                 fun() ->
-                        Start = now(),
+                        Start = os:timestamp(),
                         [?MODULE:timeit_mg([42]) || _ <- Reps],
-                        [unused, {timer:now_diff(now(), Start), unused}]
+                        [unused, {timer:now_diff(os:timestamp(), Start), unused}]
                 end,
                 ?REPS),
-    mochiglobal:delete(?MAGIC).
+    riak_core_mochiglobal:delete(?MAGIC).
 
 timeit_best_off_test() ->
     timeit_best_common("timeit_best OFF (fastest)", false).
@@ -239,10 +233,10 @@ timeit_best_common(Label, InitTheDTraceStuff_p) ->
             Reps = lists:seq(1, ?REPS),
             test_common(Label,
                         fun() ->
-                                Start = now(),
+                                Start = os:timestamp(),
                                 [?MODULE:timeit_best([42]) || _ <- Reps],
                                 %% X = lists:usort([?MODULE:timeit_best([42]) || _ <- Reps]), io:format(user, "Label ~s out ~p\n", [Label, X]),
-                                [unused, {timer:now_diff(now(), Start), unused}]
+                                [unused, {timer:now_diff(os:timestamp(), Start), unused}]
                         end,
                         ?REPS)
     end.

@@ -81,14 +81,16 @@
          get/1,
          get/2,
          all/0,
-         update_ring/1,
-         ring_changed/1]).
+         update_ring/1]).
+
+-export([make_capability/4,
+         preferred_modes/4]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--type capability() :: atom().
+-type capability() :: atom() | {atom(), atom()}.
 -type mode() :: term().
 
 -record(capability, {supported :: [mode()],
@@ -98,6 +100,7 @@
 -type registered() :: [{capability(), #capability{}}].
 
 -record(state, {registered :: registered(),
+                last_ring_id :: term(),
                 supported :: [{node(), [{capability(), [mode()]}]}],
                 unknown :: [node()],
                 negotiated :: [{capability(), mode()}]
@@ -179,18 +182,20 @@ update_ring(Ring) ->
             add_supported_to_ring(node(), Supported, Ring)
     end.
 
-%% @doc Internal callback used by `riak_core_ring_handler' to notify the
-%%      capability manager of a new ring
-%% @hidden
-ring_changed(Ring) ->
-    gen_server:call(?MODULE, {ring_changed, Ring}, infinity).
+%% @doc
+%% Make a capbility from a capability atom, a list of supported modes,
+%% the default mode, and a mapping from a legacy var to it's capabilities.
+-spec make_capability(capability(), [mode()], mode(), term())
+                     -> {capability(), #capability{}}.
+make_capability(Capability, Supported, Default, Legacy) ->
+    {Capability, capability_info(Supported, Default, Legacy)}.
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
 init([]) ->
-    ets:new(?ETS, [named_table, {read_concurrency, true}]),
+    ?ETS = ets:new(?ETS, [named_table, {read_concurrency, true}]),
     schedule_tick(),
     Registered = load_registered(),
     State = init_state(Registered),
@@ -210,20 +215,20 @@ handle_call({register, Capability, Info}, _From, State) ->
     publish_supported(State4),
     update_local_cache(State4),
     save_registered(State4#state.registered),
-    {reply, ok, State4};
+    {reply, ok, State4}.
 
-handle_call({ring_changed, Ring}, _From, State) ->
-    State2 = update_supported(Ring, State),
-    {reply, ok, State2}.
+handle_cast(_Msg, State) ->
+    {noreply, State}.
 
-handle_cast(tick, State) ->
+handle_info(tick, State) ->
     schedule_tick(),
-    State2 =
+    State2 = maybe_update_supported(State),
+    State3 =
         lists:foldl(fun(Node, StateAcc) ->
                             add_node(Node, [], StateAcc)
-                    end, State, State#state.unknown),
-    State3 = renegotiate_capabilities(State2),
-    {noreply, State3}.
+                    end, State2, State2#state.unknown),
+    State4 = renegotiate_capabilities(State3),
+    {noreply, State4};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -238,6 +243,16 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+maybe_update_supported(State=#state{last_ring_id=LastID}) ->
+    case riak_core_ring_manager:get_ring_id() of
+        LastID ->
+            State;
+        RingID ->
+            {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+            State2 = update_supported(Ring, State),
+            State2#state{last_ring_id=RingID}
+    end.
+
 capability_info(Supported, Default, Legacy) ->
     #capability{supported=Supported, default=Default, legacy=Legacy}.
 
@@ -245,7 +260,7 @@ schedule_tick() ->
     Tick = app_helper:get_env(riak_core,
                               capability_tick,
                               10000),
-    timer:apply_after(Tick, gen_server, cast, [?MODULE, tick]).
+    erlang:send_after(Tick, ?MODULE, tick).
 
 %% Capabilities are re-initialized if riak_core_capability server crashes
 reload(State=#state{registered=[]}) ->
@@ -374,9 +389,7 @@ publish_supported(State) ->
                         ignore
                 end
         end,
-    spawn(fun() ->
-                  riak_core_ring_manager:ring_trans(F, ok)
-          end),
+    riak_core_ring_manager:ring_trans(F, ok),
     ok.
 
 %% Add a node's capabilities to the provided ring
@@ -391,6 +404,24 @@ add_supported_to_ring(Node, Supported, Ring) ->
             {true, Ring2}
     end.
 
+%% @doc
+%% Given my node's capabilities, my node's registered default modes, the
+%% list of application env overrides, and the current view of all node's
+%% supported capabilities, determine the most preferred mode for each capability
+%% that is supported by all nodes.
+-spec preferred_modes([{capability(), [mode()]}],
+                      [{node(), [{capability(), [mode()]}]}],
+                       registered(),
+                       [{capability(), [mode()]}])
+                      -> [{capability(), mode()}].
+preferred_modes(MyCaps, Capabilities, Registered, Override) ->
+    N1 = reformat_capabilities(Registered, Capabilities),
+    N2 = intersect_capabilities(N1),
+    N3 = order_by_preference(MyCaps, N2),
+    N4 = override_capabilities(N3, Override),
+    N5 = [{Cap, hd(Common)} || {Cap, Common} <- N4],
+    N5.
+
 %% Given the current view of each node's supported capabilities, determine
 %% the most preferred mode for each capability that is supported by all nodes
 %% in the cluster.
@@ -400,18 +431,18 @@ negotiate_capabilities(Node, Override, State=#state{registered=Registered,
         error ->
             State;
         {ok, MyCaps} ->
-            N1 = reformat_capabilities(Registered, Capabilities),
-            N2 = intersect_capabilities(N1),
-            N3 = order_by_preference(MyCaps, N2),
-            N4 = override_capabilities(N3, Override),
-            N5 = [{Cap, hd(Common)} || {Cap, Common} <- N4],
-            State#state{negotiated=N5}
+            N = preferred_modes(MyCaps, Capabilities, Registered, Override),
+            State#state{negotiated=N}
     end.
 
 renegotiate_capabilities(State=#state{supported=[]}) ->
     State;
 renegotiate_capabilities(State) ->
-    Caps = orddict:fetch(node(), State#state.supported),
+    Caps = 
+        case orddict:find(node(), State#state.supported) of 
+            {ok, Val} -> Val;
+            error -> error("Node name mismatch, move or remove stale ring file")                       
+        end,
     Overrides = get_overrides(Caps),
     State2 = negotiate_capabilities(node(), Overrides, State),
     process_capability_changes(State#state.negotiated,
@@ -578,7 +609,7 @@ query_capability(_, Capability, DefaultSup, undefined) ->
     {true, Default};
 query_capability(Node, Capability, DefaultSup, {App, Var, Map}) ->
     Default = {Capability, [DefaultSup]},
-    Result = rpc:call(Node, application, get_env, [App, Var]),
+    Result = riak_core_util:safe_rpc(Node, application, get_env, [App, Var]),
     case Result of
         {badrpc, _} ->
             {false, Default};
